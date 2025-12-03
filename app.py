@@ -1413,27 +1413,20 @@ with tab_dash:
 # ANALYTICS
 # -----------------------------------------------------------------------------
 with tab_analytics:
-    import calendar  # local import is fine here
-
-    st.header("Analytics – macro one-pager")
+    st.header("Analytics – one-pager")
 
     st.markdown(
         """
-        <p style="font-size:13px; color:#555555; margin-top:0rem; margin-bottom:0.55rem;">
-        Block-level snapshot of the cycle for the current focus economy, based on rolling,
-        out-of-sample z-scores for a compact set of high-frequency indicators.
+        <p style="font-size:13px; color:#555555; margin-top:0rem; margin-bottom:0.5rem;">
+        Rolling, out-of-sample signals on a small set of core indicators. One look should tell you:
+        (i) how hot/cold the economy is, (ii) which block is most concerning, and (iii) where prints are
+        most likely to mean-revert vs beat/miss.
         </p>
         """,
         unsafe_allow_html=True,
     )
 
-    try:
-        constraints = fetch_constraints_panel(country)
-        panel = pd.DataFrame(constraints.get("panel", []))
-    except Exception as e:
-        st.error(f"Error fetching panel data: {e}")
-        st.stop()
-
+    # pull high-frequency series for current focus country (cached)
     try:
         hf_data = fetch_highfreq(country)
         series = hf_data.get("series", {}) or {}
@@ -1441,229 +1434,220 @@ with tab_analytics:
         st.error(f"Error fetching high-frequency data: {e}")
         st.stop()
 
-    if panel.empty and not series:
-        st.info("No data available for analytics.")
-        st.stop()
-
-    # config per indicator used in analytics
-    # source: "hf" (high-frequency) or "panel" (annual)
-    # transform: "level" or "yoy"
-    # good_when_high: True => high == healthy; False => high == restrictive/negative
-    # block: macro block label for heatmap aggregation
-    analytics_metrics = {
-        "real_gdp_growth": {
-            "label": "Real GDP growth (annual)",
-            "source": "panel",
-            "transform": "level",
-            "good_when_high": True,
-            "block": "Growth",
-        },
-        "wages": {
-            "label": "Wage growth (YoY)",
-            "source": "hf",
-            "transform": "yoy",
-            "good_when_high": True,
-            "block": "Growth",
-        },
-        "unemployment": {
-            "label": "Unemployment rate",
-            "source": "hf",
-            "transform": "level",
-            "good_when_high": False,
-            "block": "Labour",
-        },
+    # core indicators and macro blocks
+    core_metrics = {
         "cpi": {
             "label": "CPI (YoY)",
-            "source": "hf",
             "transform": "yoy",
             "good_when_high": False,
             "block": "Inflation",
         },
         "policy_rate": {
             "label": "Policy rate",
-            "source": "hf",
             "transform": "level",
             "good_when_high": False,
             "block": "Policy stance",
         },
-        "yield_10y": {
-            "label": "10Y nominal yield",
-            "source": "hf",
+        "unemployment": {
+            "label": "Unemployment rate",
             "transform": "level",
             "good_when_high": False,
-            "block": "Financial conditions",
+            "block": "Labour",
+        },
+        "wages": {
+            "label": "Wage growth (YoY)",
+            "transform": "yoy",
+            "good_when_high": True,
+            "block": "Labour",
+        },
+        "yield_10y": {
+            "label": "10Y nominal yield",
+            "transform": "level",
+            "good_when_high": False,
+            "block": "Rates/term premia",
         },
         "real_yield_10y": {
             "label": "10Y real yield",
-            "source": "hf",
             "transform": "level",
             "good_when_high": False,
-            "block": "Financial conditions",
-        },
-        "current_account": {
-            "label": "Current account",
-            "source": "hf",
-            "transform": "level",
-            "good_when_high": True,
-            "block": "External",
-        },
-        "reer": {
-            "label": "REER proxy (YoY)",
-            "source": "hf",
-            "transform": "yoy",
-            "good_when_high": False,
-            "block": "External",
+            "block": "Rates/term premia",
         },
     }
 
-    window_months = 120  # 10y rolling for "out-of-sample" normalisation
-    max_monthly_mom_lag = 12
-    max_annual_mom_lag_years = 3
+    # prep helpers – all vectorised
+    def prep_metric_df(raw_json: Any) -> pd.DataFrame:
+        df = series_to_df(raw_json)
+        if df.empty:
+            return df
+        df = df.sort_values("date").copy()
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df["yoy"] = df["value"].pct_change(12) * 100.0
+        df["mom"] = df["value"].pct_change(1) * 100.0
+        df["year"] = df["date"].dt.year
+        df["month"] = df["date"].dt.month
+        return df
 
-    metric_rows = []
-    block_scores_level = {}
-    block_scores_mom = {}
+    def rolling_z(s: pd.Series, window_obs: int) -> pd.Series:
+        s = pd.to_numeric(s, errors="coerce")
+        valid = s.dropna()
+        if valid.shape[0] < 8:
+            return pd.Series(index=s.index, dtype="float64")
+        w = min(window_obs, valid.shape[0])
+        roll = s.rolling(window=w, min_periods=max(12, w // 3))
+        mu = roll.mean()
+        sigma = roll.std()
+        z = (s - mu) / sigma
+        z[~np.isfinite(z)] = np.nan
+        return z
 
-    # helper: small percentile function (no scipy)
-    def percentile_rank(vals: pd.Series, latest: float) -> float:
-        vals = vals.dropna()
-        if vals.empty:
-            return np.nan
-        return float((vals <= latest).mean())
-
-    for key, cfg in analytics_metrics.items():
-        src = cfg["source"]
-
-        if src == "hf":
-            raw = series.get(key)
-            if not raw:
-                continue
-            df = series_to_df(raw)
-            if df.empty:
-                continue
-            df = df.sort_values("date")
-        else:
-            if panel.empty or key not in panel.columns:
-                continue
-            df = panel[["year", key]].dropna()
-            if df.empty:
-                continue
-            df = df.rename(columns={key: "value"}).copy()
-            df["date"] = pd.to_datetime(df["year"].astype(int).astype(str) + "-12-31")
-            df = df[["date", "value"]].sort_values("date")
-
-        if cfg["transform"] == "yoy":
-            if src == "hf":
-                df = compute_yoy(df, "value", periods=12)
-                col = "yoy"
-            else:
-                df["yoy"] = df["value"].pct_change(1) * 100.0
-                col = "yoy"
-        else:
-            col = "value"
-
-        df = df.dropna(subset=[col])
+    metric_frames: dict[str, pd.DataFrame] = {}
+    for key in core_metrics.keys():
+        raw = series.get(key)
+        if not raw:
+            continue
+        df = prep_metric_df(raw)
         if df.empty:
             continue
+        metric_frames[key] = df
 
-        # level z-score (rolling)
-        df["z_level"] = z_score(
-            df[col].astype("float64"),
-            df["date"],
-            mode="Rolling",
-            window_months=window_months,
-        )
+    if not metric_frames:
+        st.info("No usable high-frequency data for analytics.")
+        st.stop()
 
-        if df["z_level"].isna().all():
+    # build snapshot
+    rows = []
+    window_months = 120  # ~10y of history
+    momentum_horizon = 6  # months
+
+    for m_key, cfg in core_metrics.items():
+        df = metric_frames.get(m_key)
+        if df is None or df.empty:
             continue
 
-        # momentum: change over lag; monthly vs annual
-        if src == "hf":
-            lag = min(max_monthly_mom_lag, len(df) - 1) if len(df) > 1 else 1
+        if cfg["transform"] == "yoy":
+            base_col = "yoy"
         else:
-            lag = min(max_annual_mom_lag_years, len(df) - 1) if len(df) > 1 else 1
+            base_col = "value"
 
-        df["delta"] = df[col] - df[col].shift(lag)
-        df["z_mom"] = z_score(
-            df["delta"].astype("float64"),
-            df["date"],
-            mode="Rolling",
-            window_months=window_months,
-        )
+        base_series = df[base_col]
+        z_base = rolling_z(base_series, window_months)
+        df["z_base"] = z_base
 
-        latest = df.iloc[-1]
-        val_latest = float(latest[col])
-        z_level_latest = float(latest["z_level"]) if not pd.isna(latest["z_level"]) else np.nan
-        z_mom_latest = float(latest["z_mom"]) if not pd.isna(latest["z_mom"]) else np.nan
-
-        if np.isnan(z_level_latest):
+        df_valid = df.dropna(subset=["z_base"])
+        if df_valid.empty:
             continue
 
+        latest = df_valid.iloc[-1]
+        latest_val = latest[base_col]
+        latest_z = latest["z_base"]
+
+        # momentum: standardised Δ over 6 months
+        delta = base_series.diff(momentum_horizon)
+        z_mom = rolling_z(delta, window_months)
+        df["z_mom"] = z_mom
+        df_mom_valid = df.dropna(subset=["z_mom"])
+        latest_mom = df_mom_valid["z_mom"].iloc[-1] if not df_mom_valid.empty else np.nan
+
+        # strength score: positive = healthy given sign convention
         direction_sign = 1.0 if cfg["good_when_high"] else -1.0
-        level_score = direction_sign * z_level_latest
-        mom_score = direction_sign * (z_mom_latest if not np.isnan(z_mom_latest) else 0.0)
+        strength_score = direction_sign * latest_z
+        momentum_score = direction_sign * latest_mom if np.isfinite(latest_mom) else np.nan
 
-        # beat / miss bias: extreme percentile given sign convention
-        pct = percentile_rank(df[col].astype("float64"), val_latest)
-        bias = "Neutral"
-        if not np.isnan(pct):
-            if cfg["good_when_high"]:
-                if pct > 0.85:
-                    bias = "Downside surprise risk"
-                elif pct < 0.15:
-                    bias = "Upside surprise risk"
-            else:
-                if pct > 0.85:
-                    bias = "Upside surprise risk"
-                elif pct < 0.15:
-                    bias = "Downside surprise risk"
+        if strength_score > 1.5:
+            macro_read = "Overheating / stretched"
+        elif strength_score < -1.5:
+            macro_read = "Weak / under pressure"
+        else:
+            macro_read = "Near normal"
 
-        metric_rows.append(
+        # seasonal beat/miss bias on YoY where available
+        seasonal_bias = "Balanced vs seasonal"
+        if "yoy" in df.columns and df["yoy"].notna().sum() >= 24:
+            df_y = df.dropna(subset=["yoy"]).copy()
+            last_y = df_y.iloc[-1]
+            cur_m = int(last_y["month"])
+            hist = df_y[(df_y["month"] == cur_m) & (df_y["date"] < last_y["date"])]["yoy"]
+            hist = hist.dropna()
+            if hist.shape[0] >= 5 and hist.std() > 0:
+                seasonal_z = (last_y["yoy"] - hist.mean()) / hist.std()
+                if seasonal_z >= 1.5:
+                    seasonal_bias = "Too hot vs seasonals (downside miss risk)"
+                elif seasonal_z <= -1.5:
+                    seasonal_bias = "Too cold vs seasonals (upside surprise risk)"
+                else:
+                    seasonal_bias = "Near seasonal norm"
+
+        rows.append(
             {
-                "Metric": cfg["label"],
                 "Block": cfg["block"],
-                "Latest": val_latest,
+                "Metric": cfg["label"],
+                "Latest_raw": latest_val,
+                "Latest": f"{latest_val:.2f}" if np.isfinite(latest_val) else "",
+                "z_score": float(latest_z),
+                "Strength_score": float(strength_score),
+                "Momentum_score": float(momentum_score) if np.isfinite(momentum_score) else np.nan,
+                "Macro_read": macro_read,
+                "Beat_miss_bias": seasonal_bias,
+                "Key": m_key,
                 "Transform": cfg["transform"],
-                "z_level": z_level_latest,
-                "z_mom": z_mom_latest,
-                "Level score": level_score,
-                "Momentum score": mom_score,
-                "Direction": "High is good" if cfg["good_when_high"] else "High is bad",
-                "Beat/miss bias": bias,
-                "Raw_key": key,
-                "Source": src,
             }
         )
 
-        block = cfg["block"]
-        block_scores_level.setdefault(block, []).append(level_score)
-        block_scores_mom.setdefault(block, []).append(mom_score)
-
-    if not metric_rows:
-        st.info("No usable indicators for analytics in this economy.")
+    if not rows:
+        st.info("No usable high-frequency data for analytics.")
         st.stop()
 
-    metric_df = pd.DataFrame(metric_rows)
+    snap_df = pd.DataFrame(rows)
 
-    # block-level aggregate scores
-    blocks = sorted(block_scores_level.keys())
-    block_level = []
-    block_mom = []
-    for b in blocks:
-        lvl = np.nanmean(block_scores_level.get(b, [np.nan]))
-        mm = np.nanmean(block_scores_mom.get(b, [np.nan]))
-        block_level.append(lvl)
-        block_mom.append(mm)
+    # sort by block, then by strength
+    snap_df = snap_df.sort_values(["Block", "Strength_score"], ascending=[True, False])
 
-    block_matrix = np.vstack([block_level, block_mom])  # 2 x N
+    st.markdown("### Snapshot table")
 
-    # --- Block heatmap (level vs momentum) ------------------------------------
+    display_df = snap_df.copy()
+    display_df["z_score"] = display_df["z_score"].map(lambda x: f"{x:.2f}")
+    display_df["Strength"] = display_df["Strength_score"].map(lambda x: f"{x:.2f}")
+    display_df["Momentum"] = display_df["Momentum_score"].map(
+        lambda x: f"{x:.2f}" if np.isfinite(x) else ""
+    )
+
+    st.dataframe(
+        display_df[["Block", "Metric", "Latest", "z_score", "Strength", "Momentum", "Macro_read", "Beat_miss_bias"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # strongest / weakest blocks from strength score
+    strongest_row = snap_df.loc[snap_df["Strength_score"].idxmax()]
+    weakest_row = snap_df.loc[snap_df["Strength_score"].idxmin()]
+
+    st.markdown(
+        f"""
+        **Read-through**
+
+        - Strongest metric: **{strongest_row['Metric']}** ({strongest_row['Block']}) – {strongest_row['Macro_read'].lower()}  
+        - Most concerning: **{weakest_row['Metric']}** ({weakest_row['Block']}) – {weakest_row['Macro_read'].lower()}  
+
+        Beat/miss bias flags highlight where the latest YoY print is most stretched vs its own seasonal history.
+        """.strip()
+    )
+
+    # block-level view: median level vs median momentum per block
+    st.markdown("---")
     st.markdown("### Block snapshot – level vs momentum")
 
-    # 2 x N matrix: row 0 = level, row 1 = momentum
+    block_scores = (
+        snap_df.groupby("Block")[["Strength_score", "Momentum_score"]]
+        .median(numeric_only=True)
+        .reset_index()
+    )
+
+    blocks = list(block_scores["Block"])
+    block_level = block_scores["Strength_score"].to_numpy()
+    block_mom = block_scores["Momentum_score"].to_numpy()
+
     block_matrix = np.vstack([block_level, block_mom])
 
-    # symmetric colour range around 0
     if np.isfinite(np.nanmax(np.abs(block_matrix))):
         max_abs = float(np.nanmax(np.abs(block_matrix)))
         if max_abs == 0:
@@ -1676,196 +1660,65 @@ with tab_analytics:
         x=blocks,
         y=["Level", "Momentum"],
         color_continuous_scale=[
-            [0.0, "#B22222"],   # red = weak / tight
-            [0.5, "#FFF7D9"],   # neutral
-            [1.0, "#006400"],   # green = strong / easy
+            [0.0, "#B22222"],
+            [0.5, "#FFF7D9"],
+            [1.0, "#006400"],
         ],
         labels={"x": "Block", "y": "", "color": "Score"},
         aspect="auto",
     )
-    # enforce symmetric range around zero so colours are comparable
     heat_fig.update_coloraxes(cmin=-max_abs, cmax=max_abs)
-
     heat_fig.update_layout(
         height=220,
         margin=dict(l=0, r=30, t=30, b=10),
         font=dict(size=10),
     )
-
     st.plotly_chart(heat_fig, width="stretch")
 
-    # simple text read-through
-    strongest_block = blocks[int(np.argmax(block_level))]
-    weakest_block = blocks[int(np.argmin(block_level))]
-
-    st.markdown(
-        f"""
-        **Read-through**
-
-        - Strongest block: **{strongest_block}**  
-        - Most vulnerable: **{weakest_block}**  
-
-        Level scores capture where the block sits relative to its own history (rolling z-scores).  
-        Momentum scores capture the direction and speed of change over the last year (or few years for annual data),
-        adjusted for whether “high” is good or bad.
-        """
-    )
-
+    # -------------------------------------------------------------------------
+    # Drill-down: one indicator
+    # -------------------------------------------------------------------------
     st.markdown("---")
-
-    # --- GIP-style quadrant using wage vs CPI signals -------------------------
-    st.markdown("### Growth–inflation quadrant (proxy)")
-
-    cpi_raw = series.get("cpi")
-    wages_raw = series.get("wages")
-
-    gip_text = "Insufficient CPI / wage data to compute GIP quadrant."
-    gip_quad = None
-
-    if cpi_raw and wages_raw:
-        cpi_df = series_to_df(cpi_raw)
-        wages_df = series_to_df(wages_raw)
-        cpi_df = compute_yoy(cpi_df, "value", 12).dropna(subset=["yoy"])
-        wages_df = compute_yoy(wages_df, "value", 12).dropna(subset=["yoy"])
-
-        merged = pd.merge(
-            cpi_df[["date", "yoy"]].rename(columns={"yoy": "cpi_yoy"}),
-            wages_df[["date", "yoy"]].rename(columns={"yoy": "wage_yoy"}),
-            on="date",
-            how="inner",
-        )
-        merged = merged.sort_values("date")
-        if len(merged) >= 24:
-            merged["real_income"] = merged["wage_yoy"] - merged["cpi_yoy"]
-
-            lookback = min(12, len(merged) - 1)
-            latest = merged.iloc[-1]
-            prev = merged.iloc[-1 - lookback]
-
-            growth_accel = latest["real_income"] - prev["real_income"]
-            infl_accel = latest["cpi_yoy"] - prev["cpi_yoy"]
-
-            if growth_accel >= 0 and infl_accel >= 0:
-                gip_quad = "G1 – reflation (growth ↑, inflation ↑)"
-            elif growth_accel >= 0 and infl_accel < 0:
-                gip_quad = "G2 – Goldilocks (growth ↑, inflation ↓)"
-            elif growth_accel < 0 and infl_accel >= 0:
-                gip_quad = "G3 – stagflation risk (growth ↓, inflation ↑)"
-            else:
-                gip_quad = "G4 – disinflation / slowdown (growth ↓, inflation ↓)"
-
-            gip_text = (
-                f"Latest proxy suggests: **{gip_quad}** "
-                f"(real income change over last {lookback} months vs inflation acceleration)."
-            )
-
-    st.markdown(
-        f"""
-        <div style="font-size:13px; color:#555555; margin-bottom:0.5rem;">
-        {gip_text}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("---")
-
-    # --- Indicator table: level + momentum + bias -----------------------------
-    st.markdown("### Indicator table")
-
-    display_df = metric_df.copy()
-    display_df["Latest"] = display_df["Latest"].map(lambda x: f"{x:.2f}")
-    display_df["z_level"] = display_df["z_level"].map(lambda x: f"{x:.2f}")
-    display_df["z_mom"] = display_df["z_mom"].map(
-        lambda x: "" if np.isnan(x) else f"{x:.2f}"
-    )
-
-    display_df = display_df.sort_values(
-        ["Block", "Level score"], ascending=[True, False]
-    )
-
-    st.dataframe(
-        display_df[
-            [
-                "Block",
-                "Metric",
-                "Latest",
-                "z_level",
-                "z_mom",
-                "Direction",
-                "Beat/miss bias",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.markdown(
-        """
-        <div class="chart-comment">
-        Level z-score is rolling, out-of-sample within-indicator. Momentum z-score is the z-score
-        of the last 12M (or few-year) change. Beat/miss bias flags where prints are most likely
-        to surprise consensus given where we are in the historical distribution.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("---")
-    st.markdown("### Drill-down: indicator detail")
+    st.markdown("### Drill-down by indicator")
 
     metric_choice = st.selectbox(
         "Indicator",
         options=list(display_df["Metric"]),
-        index=0,
+        index=list(display_df["Metric"]).index(weakest_row["Metric"]) if len(display_df) > 0 else 0,
     )
-    row = display_df[display_df["Metric"] == metric_choice].iloc[0]
-    raw_key = row["Raw_key"]
-    src = row["Source"]
 
-    if src == "hf":
-        df_full = series_to_df(series.get(raw_key, []))
-        if df_full.empty:
-            st.info("No data for this indicator.")
-            st.stop()
-        df_full = df_full.sort_values("date")
-    else:
-        if panel.empty or raw_key not in panel.columns:
-            st.info("No data for this indicator.")
-            st.stop()
-        df_full = panel[["year", raw_key]].dropna()
-        df_full = df_full.rename(columns={raw_key: "value"}).copy()
-        df_full["date"] = pd.to_datetime(
-            df_full["year"].astype(int).astype(str) + "-12-31"
-        )
-        df_full = df_full[["date", "value"]].sort_values("date")
+    meta_row = snap_df[snap_df["Metric"] == metric_choice].iloc[0]
+    m_key = meta_row["Key"]
+    df_full = metric_frames.get(m_key)
+    if df_full is None or df_full.empty:
+        st.info("No data for this indicator.")
+        st.stop()
 
-    df_full["yoy"] = df_full["value"].pct_change(12 if src == "hf" else 1) * 100.0
-    df_full["mom"] = df_full["value"].pct_change(1) * 100.0
+    df_full = df_full.sort_values("date").copy()
 
     chart_mode = st.radio(
         "Chart basis",
         ["Level", "YoY %", "MoM %"],
-        index=0,
+        index=1 if meta_row["Transform"] == "yoy" else 0,
         horizontal=True,
-        key="analytics_chart_mode",
     )
 
     if chart_mode == "Level":
         y_col = "value"
         y_label = "Level / index"
-    elif chart_mode == "YoY %":
-        y_col = "yoy"
-        y_label = "YoY %"
-    else:
+    elif chart_mode == "MoM %":
         y_col = "mom"
         y_label = "MoM %"
+    else:
+        y_col = "yoy"
+        y_label = "YoY %"
 
     df_chart = df_full.dropna(subset=[y_col])
     if df_chart.empty:
         st.info("Not enough data under this transformation.")
         st.stop()
 
+    # main line chart
     fig_line = px.line(
         df_chart,
         x="date",
@@ -1873,46 +1726,57 @@ with tab_analytics:
         labels={"date": "Date", y_col: y_label},
         color_discrete_sequence=[PRIMARY_COLOR],
     )
+
+    rec_ranges = get_recession_ranges_for_country(country)
+    if rec_ranges:
+        fig_line = add_recession_bands(
+            fig_line,
+            rec_ranges,
+            window_start=df_chart["date"].min(),
+            window_end=df_chart["date"].max(),
+        )
+
     fig_line = style_figure(fig_line, height=280, legend=False)
-    st.plotly_chart(fig_line, use_container_width=True)
+    st.plotly_chart(fig_line, width="stretch")
 
     st.markdown(
         '<div class="chart-comment">'
-        'Line chart lets you sanity-check the block and table read-through against the raw series.'
+        'Line chart shows raw levels / % changes; regime calls in the table come from rolling, out-of-sample '
+        'normalisation over the last ~10 years.'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    # bar chart on last N years for higher-frequency indicators
-    if src == "hf":
-        bar_years = st.slider(
-            "Bar window (years)",
-            min_value=3,
-            max_value=20,
-            value=5,
-            step=1,
-            key="analytics_bar_years_v2",
-        )
-        cutoff = df_chart["date"].max() - pd.DateOffset(years=bar_years)
-        df_bar = df_chart[df_chart["date"] >= cutoff].copy()
+    # bar chart on last N years
+    bar_years = st.slider(
+        "Bar window (years)",
+        min_value=3,
+        max_value=20,
+        value=5,
+        step=1,
+        help="Shorter window = more recent dynamics; longer = full-cycle view.",
+        key="analytics_bar_years",
+    )
 
-        if not df_bar.empty:
-            fig_bar = px.bar(
-                df_bar,
-                x="date",
-                y=y_col,
-                labels={"date": "Date", y_col: y_label},
-                color_discrete_sequence=[PRIMARY_COLOR],
-            )
-            fig_bar = style_figure(fig_bar, height=220, legend=False)
-            st.plotly_chart(fig_bar, use_container_width=True)
+    cutoff = df_chart["date"].max() - pd.DateOffset(years=bar_years)
+    df_bar = df_chart[df_chart["date"] >= cutoff].copy()
 
-            st.markdown(
-                '<div class="chart-comment">'
-                'Recent bars show whether the series is accelerating or rolling over into the latest prints.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+    fig_bar = px.bar(
+        df_bar,
+        x="date",
+        y=y_col,
+        labels={"date": "Date", y_col: y_label},
+        color_discrete_sequence=[PRIMARY_COLOR],
+    )
+    fig_bar = style_figure(fig_bar, height=220, legend=False)
+    st.plotly_chart(fig_bar, width="stretch")
+
+    st.markdown(
+        '<div class="chart-comment">'
+        'Bars isolate recent history to show whether the series is accelerating or rolling over into the latest prints.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     # seasonality heatmap on YoY
     st.markdown("#### Seasonality heatmap (YoY %)")
@@ -1921,6 +1785,8 @@ with tab_analytics:
     if df_season.empty:
         st.info("Not enough YoY history to compute seasonality.")
     else:
+        import calendar
+
         df_season["year"] = df_season["date"].dt.year
         df_season["month"] = df_season["date"].dt.month
 
@@ -1935,20 +1801,18 @@ with tab_analytics:
             aspect="auto",
             labels={"x": "Month", "y": "Year", "color": "YoY %"},
             x=month_labels,
-            color_continuous_scale="RdBu_r",
-            zmid=0.0,
         )
         fig_heat.update_layout(
             height=260,
             margin=dict(l=0, r=30, t=25, b=5),
             font=dict(size=10),
         )
-        st.plotly_chart(fig_heat, use_container_width=True)
+        st.plotly_chart(fig_heat, width="stretch")
 
         st.markdown(
             '<div class="chart-comment">'
-            'Seasonality heatmap highlights whether the latest year is behaving like a typical year or breaking the usual pattern, '
-            'which feeds into the beat/miss bias on upcoming prints.'
+            'Heatmap shows how the latest year compares to its own seasonal pattern. Strong red/blue in the last row '
+            'signals a regime shift vs typical seasonality.'
             '</div>',
             unsafe_allow_html=True,
         )
