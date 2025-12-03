@@ -1660,25 +1660,39 @@ with tab_analytics:
     # --- Block heatmap (level vs momentum) ------------------------------------
     st.markdown("### Block snapshot – level vs momentum")
 
+    # 2 x N matrix: row 0 = level, row 1 = momentum
+    block_matrix = np.vstack([block_level, block_mom])
+
+    # symmetric colour range around 0
+    if np.isfinite(np.nanmax(np.abs(block_matrix))):
+        max_abs = float(np.nanmax(np.abs(block_matrix)))
+        if max_abs == 0:
+            max_abs = 1.0
+    else:
+        max_abs = 1.0
+
     heat_fig = px.imshow(
         block_matrix,
         x=blocks,
         y=["Level", "Momentum"],
         color_continuous_scale=[
-            [0.0, "#B22222"],
-            [0.5, "#FFF7D9"],
-            [1.0, "#006400"],
+            [0.0, "#B22222"],   # red = weak / tight
+            [0.5, "#FFF7D9"],   # neutral
+            [1.0, "#006400"],   # green = strong / easy
         ],
-        zmid=0.0,
         labels={"x": "Block", "y": "", "color": "Score"},
         aspect="auto",
     )
+    # enforce symmetric range around zero so colours are comparable
+    heat_fig.update_coloraxes(cmin=-max_abs, cmax=max_abs)
+
     heat_fig.update_layout(
         height=220,
         margin=dict(l=0, r=30, t=30, b=10),
         font=dict(size=10),
     )
-    st.plotly_chart(heat_fig, use_container_width=True)
+
+    st.plotly_chart(heat_fig, width="stretch")
 
     # simple text read-through
     strongest_block = blocks[int(np.argmax(block_level))]
