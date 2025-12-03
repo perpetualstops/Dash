@@ -24,9 +24,20 @@ except ImportError:
     HAVE_CURL_CFFI = False
 
 # -----------------------------------------------------------------------------
-# Backend: config
+# Backend: config & HTTP session (Streamlit version)
 # -----------------------------------------------------------------------------
 
+import math
+from functools import lru_cache
+from typing import Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
+
+import requests
+import pandas as pd
+import numpy as np
+
+# Reuse a single HTTP session (important on Streamlit Cloud)
 SESSION = requests.Session()
 SESSION.headers.update(
     {
@@ -35,28 +46,36 @@ SESSION.headers.update(
     }
 )
 
+# -----------------------------------------------------------------------------
+# Config: countries & series
+# -----------------------------------------------------------------------------
+
 FRED_API_KEY = "7a1c5818d73952bce4995758997574ce"
 
+# World Bank indicators (annual)
 WB_INDICATORS: Dict[str, str] = {
-    "cpi_yoy": "FP.CPI.TOTL.ZG",
-    "debt_gdp": "GC.DOD.TOTL.GD.ZS",
-    "fiscal_balance": "GC.BAL.CASH.GD.ZS",
-    "real_gdp_growth": "NY.GDP.MKTP.KD.ZG",
-    "private_credit_gdp": "FS.AST.PRVT.GD.ZS",
+    "cpi_yoy": "FP.CPI.TOTL.ZG",               # Inflation, consumer prices (annual %)
+    "debt_gdp": "GC.DOD.TOTL.GD.ZS",           # Central govt debt (% of GDP)
+    "fiscal_balance": "GC.BAL.CASH.GD.ZS",     # Cash surplus/deficit (% of GDP)
+    "real_gdp_growth": "NY.GDP.MKTP.KD.ZG",    # Real GDP growth (annual %)
+    "private_credit_gdp": "FS.AST.PRVT.GD.ZS", # Domestic credit to private sector (% of GDP)
 }
 
+# FRED series IDs for ANNUAL policy rate aggregation
 FRED_SERIES_POLICY: Dict[str, str] = {
     "United States": "FEDFUNDS",
     "Japan": "IRSTCB01JPM156N",
     "Euro Area": "ECBMRRFR",
 }
 
+# World Bank country codes
 WB_COUNTRY: Dict[str, str] = {
     "United States": "USA",
     "Japan": "JPN",
     "Euro Area": "EMU",
 }
 
+# Approximate recession bands for shading (year ranges)
 RECESSIONS: Dict[str, list] = {
     "United States": [
         {"start": 1990, "end": 1991},
@@ -77,12 +96,14 @@ RECESSIONS: Dict[str, list] = {
     ],
 }
 
+# Simple “neutral” real rate to compute gaps
 NEUTRAL_REAL_RATE: Dict[str, float] = {
     "United States": 1.0,
     "Japan": 0.0,
     "Euro Area": 0.5,
 }
 
+# High-frequency FRED series for each country
 FRED_HF_SERIES: Dict[str, Dict[str, str]] = {
     "United States": {
         "cpi": "CPIAUCSL",
@@ -107,7 +128,7 @@ FRED_HF_SERIES: Dict[str, Dict[str, str]] = {
     "Euro Area": {
         "cpi": "CP0000EZ19M086NEST",
         "policy_rate": "ECBMRRFR",
-        "unemployment": "UNRATE",
+        "unemployment": "UNRATE",   # fallback
         "wages": "",
         "reer": "",
         "current_account": "",
@@ -116,11 +137,12 @@ FRED_HF_SERIES: Dict[str, Dict[str, str]] = {
     },
 }
 
-MAX_WB_WORKERS: int = 3
-MAX_FRED_HF_WORKERS: int = 4
+# Concurrency knobs (safe for Streamlit Cloud)
+MAX_WB_WORKERS: int = 5
+MAX_FRED_HF_WORKERS: int = 8
 
 # -----------------------------------------------------------------------------
-# Backend: core fetchers
+# World Bank + FRED fetchers (with caching + parallelism)
 # -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
@@ -130,6 +152,9 @@ def fetch_worldbank_series(
     start_year: int = 1990,
     end_year: int = 2100,
 ) -> pd.DataFrame:
+    """
+    Pull a single World Bank indicator for one country, annual frequency.
+    """
     url = (
         f"https://api.worldbank.org/v2/country/{wb_country}/indicator/{indicator}"
         f"?format=json&per_page=2000&date={start_year}:{end_year}"
@@ -167,6 +192,9 @@ def fetch_worldbank_series(
 
 @lru_cache(maxsize=None)
 def fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd.DataFrame:
+    """
+    Pull a single FRED series as a daily/monthly DataFrame.
+    """
     if not series_id:
         return pd.DataFrame(columns=["date", "value"])
 
@@ -203,6 +231,9 @@ def fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd.Data
 
 
 def safe_fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd.DataFrame:
+    """
+    Wrapper that never throws – returns empty frame on error.
+    """
     if not series_id:
         return pd.DataFrame(columns=["date", "value"])
     try:
@@ -212,6 +243,10 @@ def safe_fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd
 
 
 def to_annual(df: pd.DataFrame, method: str = "mean") -> pd.DataFrame:
+    """
+    Convert a high-frequency series to annual.
+    method = 'mean' (default) or 'last'.
+    """
     if df.empty:
         return pd.DataFrame(columns=["year", "value"])
     df = df.copy()
@@ -223,27 +258,15 @@ def to_annual(df: pd.DataFrame, method: str = "mean") -> pd.DataFrame:
         ann = df.groupby("year", as_index=False)["value"].mean()
     return ann.sort_values("year")
 
-
-def fred_level_to_annual_yoy(df: pd.DataFrame, periods: int = 12) -> pd.DataFrame:
-    """
-    Take a high-frequency level index (e.g. CPI), compute 12m YoY %,
-    then aggregate to annual mean YoY.
-    """
-    if df.empty:
-        return pd.DataFrame(columns=["year", "value"])
-    df = df.copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date")
-    df["yoy"] = df["value"].pct_change(periods=periods) * 100.0
-    df = df.dropna(subset=["yoy"])
-    if df.empty:
-        return pd.DataFrame(columns=["year", "value"])
-    df = df[["date", "yoy"]].rename(columns={"yoy": "value"})
-    ann = to_annual(df, method="mean")
-    return ann
-
+# -----------------------------------------------------------------------------
+# Parallel bulk fetch helpers
+# -----------------------------------------------------------------------------
 
 def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch all WB_INDICATORS for one country in parallel.
+    Returns dict: indicator_name -> DataFrame(year, value_col_named_after_indicator).
+    """
     def worker(name: str, ind: str) -> tuple[str, pd.DataFrame]:
         df = fetch_worldbank_series(wb_code, ind, start_year=1990, end_year=2100)
         df = df.rename(columns={"value": name})
@@ -257,7 +280,10 @@ def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
 
     max_workers = min(len(items), MAX_WB_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(worker, name, ind): name for name, ind in items}
+        future_map = {
+            executor.submit(worker, name, ind): name
+            for name, ind in items
+        }
         for fut in as_completed(future_map):
             name = future_map[fut]
             try:
@@ -266,6 +292,7 @@ def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
             except Exception:
                 results[name] = pd.DataFrame(columns=["year", name])
 
+    # Ensure all keys exist
     for name in WB_INDICATORS.keys():
         results.setdefault(name, pd.DataFrame(columns=["year", name]))
 
@@ -273,6 +300,10 @@ def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
 
 
 def _fetch_highfreq_bulk(mapping: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+    """
+    Fetch all high-frequency FRED series for one country in parallel.
+    Returns dict: metric_name -> DataFrame(date, value).
+    """
     def worker(name: str, sid: str) -> tuple[str, pd.DataFrame]:
         if not sid:
             return name, pd.DataFrame(columns=["date", "value"])
@@ -289,7 +320,10 @@ def _fetch_highfreq_bulk(mapping: Dict[str, str]) -> Dict[str, pd.DataFrame]:
 
     max_workers = min(len(items), MAX_FRED_HF_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(worker, name, sid): name for name, sid in items}
+        future_map = {
+            executor.submit(worker, name, sid): name
+            for name, sid in items
+        }
         for fut in as_completed(future_map):
             name = future_map[fut]
             try:
@@ -304,36 +338,24 @@ def _fetch_highfreq_bulk(mapping: Dict[str, str]) -> Dict[str, pd.DataFrame]:
     return results
 
 # -----------------------------------------------------------------------------
-# Backend: panel + high-frequency bundle + calendar
+# Panel construction (annual macro constraints)
 # -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
 def build_country_panel(country: str) -> pd.DataFrame:
+    """
+    Build the annual constraints panel for one country.
+    This is exactly your FastAPI logic, adapted for in-process use.
+    """
     if country not in WB_COUNTRY:
         raise ValueError(f"Unsupported country: {country}")
 
     wb_code = WB_COUNTRY[country]
+
+    # 1) World Bank block in parallel
     series_dfs: Dict[str, pd.DataFrame] = _fetch_worldbank_bulk(wb_code)
 
-    # --- FRED fallback for CPI YoY if World Bank CPI YoY is missing ----------------
-    cpi_df = series_dfs.get("cpi_yoy")
-    needs_cpi_fallback = (
-        cpi_df is None
-        or cpi_df.empty
-        or ("cpi_yoy" in cpi_df.columns and cpi_df["cpi_yoy"].isna().all())
-    )
-
-    if needs_cpi_fallback:
-        hf_map = FRED_HF_SERIES.get(country, {})
-        sid_cpi = hf_map.get("cpi")
-        if sid_cpi:
-            hf_cpi = safe_fetch_fred_series(sid_cpi, start_date="1990-01-01")
-            ann_cpi_yoy = fred_level_to_annual_yoy(hf_cpi, periods=12)
-            if not ann_cpi_yoy.empty:
-                ann_cpi_yoy = ann_cpi_yoy.rename(columns={"value": "cpi_yoy"})
-                series_dfs["cpi_yoy"] = ann_cpi_yoy
-
-    # --- policy series -------------------------------------------------------------
+    # 2) FRED policy rate (annualised)
     policy_id = FRED_SERIES_POLICY.get(country, "")
     if policy_id:
         pol = safe_fetch_fred_series(policy_id, start_date="1990-01-01")
@@ -341,6 +363,7 @@ def build_country_panel(country: str) -> pd.DataFrame:
     else:
         pol_ann = pd.DataFrame(columns=["year", "policy_rate"])
 
+    # 3) Unified year index
     years: set[int] = set()
     for df in series_dfs.values():
         if "year" in df.columns:
@@ -352,17 +375,22 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     panel = pd.DataFrame({"year": sorted(y for y in years if y >= 1990)})
 
+    # 4) Merge all World Bank indicators
     for name, df in series_dfs.items():
         if "year" in df.columns:
             panel = panel.merge(df[["year", name]], on="year", how="left")
 
+    # 5) Ensure all indicator columns exist
     for name in WB_INDICATORS.keys():
         if name not in panel.columns:
             panel[name] = np.nan
 
+    # 6) Merge policy rate
     panel = panel.merge(pol_ann, on="year", how="left")
 
+    # 7) Derived columns
     infl_col = "cpi_yoy"
+
     if infl_col in panel.columns:
         panel["real_policy_rate"] = panel["policy_rate"] - panel[infl_col]
     else:
@@ -370,6 +398,7 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     neutral = NEUTRAL_REAL_RATE.get(country, 0.0)
     panel["neutral_real_rate"] = neutral
+
     panel["real_rate_minus_neutral"] = panel["real_policy_rate"] - panel["neutral_real_rate"]
 
     if "real_gdp_growth" in panel.columns:
@@ -384,7 +413,7 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     panel["inflation_target"] = 2.0
 
-    # Only coerce object dtypes; avoid FutureWarning from errors='ignore'
+    # 8) Clean types – only coerce object cols (avoids FutureWarning)
     for col in panel.select_dtypes(include="object").columns:
         if col == "year":
             continue
@@ -397,13 +426,22 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     return panel.sort_values("year").reset_index(drop=True)
 
+# -----------------------------------------------------------------------------
+# High-frequency bundle (macro block B)
+# -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
 def build_highfreq_bundle(country: str) -> Dict[str, pd.DataFrame]:
+    """
+    Build the high-frequency bundle for one country – exactly as in your
+    FastAPI backend, just without the HTTP layer.
+    """
     if country not in FRED_HF_SERIES:
         raise ValueError(f"Unsupported country: {country}")
+
     mapping = FRED_HF_SERIES[country]
     return _fetch_highfreq_bulk(mapping)
+
 
 
 def build_calendar(country: str) -> Dict:
