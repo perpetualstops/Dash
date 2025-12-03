@@ -4,6 +4,7 @@ from typing import Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 import calendar
+from typing import Any
 
 import requests
 import pandas as pd
