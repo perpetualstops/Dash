@@ -1,43 +1,24 @@
 import math
 from functools import lru_cache
-from typing import Dict
+from typing import Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
-import calendar
-from typing import Any
+from datetime import datetime, date
 
 import requests
 import pandas as pd
 import numpy as np
 
+import numpy as np
 import yfinance as yf
 import datetime as dt
 import plotly.express as px
 import streamlit as st
 from streamlit.components.v1 import html as st_html
 
-try:
-    from curl_cffi import requests as curl_requests
-    HAVE_CURL_CFFI = True
-except ImportError:
-    curl_requests = None
-    HAVE_CURL_CFFI = False
-
 # -----------------------------------------------------------------------------
-# Backend: config & HTTP session (Streamlit version)
+# Global HTTP session (connection reuse)
 # -----------------------------------------------------------------------------
 
-import math
-from functools import lru_cache
-from typing import Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
-
-import requests
-import pandas as pd
-import numpy as np
-
-# Reuse a single HTTP session (important on Streamlit Cloud)
 SESSION = requests.Session()
 SESSION.headers.update(
     {
@@ -137,9 +118,68 @@ FRED_HF_SERIES: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Concurrency knobs (safe for Streamlit Cloud)
+# Concurrency knobs
 MAX_WB_WORKERS: int = 5
 MAX_FRED_HF_WORKERS: int = 8
+
+# -----------------------------------------------------------------------------
+# JSON sanitiser – kill NaN / inf everywhere
+# -----------------------------------------------------------------------------
+
+def _sanitize_for_json(obj: Any) -> Any:
+    if isinstance(obj, pd.DataFrame):
+        obj = obj.replace([np.inf, -np.inf], np.nan)
+        records = obj.to_dict(orient="records")
+        return [_sanitize_for_json(r) for r in records]
+
+    if isinstance(obj, pd.Series):
+        return _sanitize_for_json(obj.to_dict())
+
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
+
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json(v) for v in obj]
+
+    try:
+        if obj is pd.NA:
+            return None
+    except Exception:
+        pass
+
+    try:
+        if isinstance(obj, float) and math.isnan(obj):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(obj, (np.floating, np.float32, np.float64)):
+        v = float(obj)
+        if math.isfinite(v):
+            return v
+        return None
+
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+
+    if isinstance(obj, float):
+        if math.isfinite(obj):
+            return obj
+        return None
+
+    if isinstance(obj, int):
+        return obj
+
+    if isinstance(obj, (bool, np.bool_)):
+        return bool(obj)
+
+    if isinstance(obj, (datetime, date, pd.Timestamp)):
+        return obj.isoformat()
+
+    if obj is None:
+        return None
+
+    return obj
 
 # -----------------------------------------------------------------------------
 # World Bank + FRED fetchers (with caching + parallelism)
@@ -152,9 +192,6 @@ def fetch_worldbank_series(
     start_year: int = 1990,
     end_year: int = 2100,
 ) -> pd.DataFrame:
-    """
-    Pull a single World Bank indicator for one country, annual frequency.
-    """
     url = (
         f"https://api.worldbank.org/v2/country/{wb_country}/indicator/{indicator}"
         f"?format=json&per_page=2000&date={start_year}:{end_year}"
@@ -192,9 +229,6 @@ def fetch_worldbank_series(
 
 @lru_cache(maxsize=None)
 def fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd.DataFrame:
-    """
-    Pull a single FRED series as a daily/monthly DataFrame.
-    """
     if not series_id:
         return pd.DataFrame(columns=["date", "value"])
 
@@ -231,9 +265,6 @@ def fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd.Data
 
 
 def safe_fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd.DataFrame:
-    """
-    Wrapper that never throws – returns empty frame on error.
-    """
     if not series_id:
         return pd.DataFrame(columns=["date", "value"])
     try:
@@ -243,10 +274,6 @@ def safe_fetch_fred_series(series_id: str, start_date: str = "1990-01-01") -> pd
 
 
 def to_annual(df: pd.DataFrame, method: str = "mean") -> pd.DataFrame:
-    """
-    Convert a high-frequency series to annual.
-    method = 'mean' (default) or 'last'.
-    """
     if df.empty:
         return pd.DataFrame(columns=["year", "value"])
     df = df.copy()
@@ -263,10 +290,6 @@ def to_annual(df: pd.DataFrame, method: str = "mean") -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
-    """
-    Fetch all WB_INDICATORS for one country in parallel.
-    Returns dict: indicator_name -> DataFrame(year, value_col_named_after_indicator).
-    """
     def worker(name: str, ind: str) -> tuple[str, pd.DataFrame]:
         df = fetch_worldbank_series(wb_code, ind, start_year=1990, end_year=2100)
         df = df.rename(columns={"value": name})
@@ -292,7 +315,6 @@ def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
             except Exception:
                 results[name] = pd.DataFrame(columns=["year", name])
 
-    # Ensure all keys exist
     for name in WB_INDICATORS.keys():
         results.setdefault(name, pd.DataFrame(columns=["year", name]))
 
@@ -300,10 +322,6 @@ def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
 
 
 def _fetch_highfreq_bulk(mapping: Dict[str, str]) -> Dict[str, pd.DataFrame]:
-    """
-    Fetch all high-frequency FRED series for one country in parallel.
-    Returns dict: metric_name -> DataFrame(date, value).
-    """
     def worker(name: str, sid: str) -> tuple[str, pd.DataFrame]:
         if not sid:
             return name, pd.DataFrame(columns=["date", "value"])
@@ -343,19 +361,13 @@ def _fetch_highfreq_bulk(mapping: Dict[str, str]) -> Dict[str, pd.DataFrame]:
 
 @lru_cache(maxsize=None)
 def build_country_panel(country: str) -> pd.DataFrame:
-    """
-    Build the annual constraints panel for one country.
-    This is exactly your FastAPI logic, adapted for in-process use.
-    """
     if country not in WB_COUNTRY:
         raise ValueError(f"Unsupported country: {country}")
 
     wb_code = WB_COUNTRY[country]
 
-    # 1) World Bank block in parallel
     series_dfs: Dict[str, pd.DataFrame] = _fetch_worldbank_bulk(wb_code)
 
-    # 2) FRED policy rate (annualised)
     policy_id = FRED_SERIES_POLICY.get(country, "")
     if policy_id:
         pol = safe_fetch_fred_series(policy_id, start_date="1990-01-01")
@@ -363,7 +375,6 @@ def build_country_panel(country: str) -> pd.DataFrame:
     else:
         pol_ann = pd.DataFrame(columns=["year", "policy_rate"])
 
-    # 3) Unified year index
     years: set[int] = set()
     for df in series_dfs.values():
         if "year" in df.columns:
@@ -375,20 +386,16 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     panel = pd.DataFrame({"year": sorted(y for y in years if y >= 1990)})
 
-    # 4) Merge all World Bank indicators
     for name, df in series_dfs.items():
         if "year" in df.columns:
             panel = panel.merge(df[["year", name]], on="year", how="left")
 
-    # 5) Ensure all indicator columns exist
     for name in WB_INDICATORS.keys():
         if name not in panel.columns:
             panel[name] = np.nan
 
-    # 6) Merge policy rate
     panel = panel.merge(pol_ann, on="year", how="left")
 
-    # 7) Derived columns
     infl_col = "cpi_yoy"
 
     if infl_col in panel.columns:
@@ -413,12 +420,10 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     panel["inflation_target"] = 2.0
 
-    # 8) Clean types – only coerce object cols (avoids FutureWarning)
-    for col in panel.select_dtypes(include="object").columns:
+    for col in panel.columns:
         if col == "year":
             continue
-        panel[col] = pd.to_numeric(panel[col], errors="coerce")
-
+        panel[col] = pd.to_numeric(panel[col], errors="ignore")
     panel.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     metric_cols = [c for c in panel.columns if c != "year"]
@@ -432,19 +437,37 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
 @lru_cache(maxsize=None)
 def build_highfreq_bundle(country: str) -> Dict[str, pd.DataFrame]:
-    """
-    Build the high-frequency bundle for one country – exactly as in your
-    FastAPI backend, just without the HTTP layer.
-    """
     if country not in FRED_HF_SERIES:
         raise ValueError(f"Unsupported country: {country}")
 
     mapping = FRED_HF_SERIES[country]
     return _fetch_highfreq_bulk(mapping)
 
+# -----------------------------------------------------------------------------
+# Backend-style payload builders (no FastAPI, used directly by Streamlit)
+# -----------------------------------------------------------------------------
+
+def build_constraints_payload(country: str) -> Dict[str, Any]:
+    panel_df = build_country_panel(country)
+    resp = {
+        "country": country,
+        "panel": panel_df,
+        "recessions": RECESSIONS.get(country, []),
+    }
+    return _sanitize_for_json(resp)
 
 
-def build_calendar(country: str) -> Dict:
+def build_highfreq_payload(country: str) -> Dict[str, Any]:
+    series_out = build_highfreq_bundle(country)
+    resp = {
+        "country": country,
+        "series": series_out,
+        "recessions": RECESSIONS.get(country, []),
+    }
+    return _sanitize_for_json(resp)
+
+
+def build_calendar_payload(country: str) -> Dict[str, Any]:
     if country not in WB_COUNTRY:
         raise ValueError(f"Unsupported country: {country}")
 
@@ -465,7 +488,7 @@ def build_calendar(country: str) -> Dict:
             {"date": f"{year}-09-18", "event": "FOMC Meeting", "importance": "high"},
             {"date": f"{year}-12-18", "event": "FOMC Meeting", "importance": "high"},
         ]
-    else:
+    else:  # Euro Area
         events = [
             {"date": f"{year}-03-15", "event": "ECB Governing Council", "importance": "high"},
             {"date": f"{year}-06-14", "event": "ECB Governing Council", "importance": "high"},
@@ -473,19 +496,31 @@ def build_calendar(country: str) -> Dict:
             {"date": f"{year}-12-13", "event": "ECB Governing Council", "importance": "high"},
         ]
 
-    return {"country": country, "events": events}
+    return _sanitize_for_json({"country": country, "events": events})
+
 
 # -----------------------------------------------------------------------------
-# Streamlit: global config
+# OPTIONAL: curl_cffi session for yfinance (frontend)
 # -----------------------------------------------------------------------------
 
-PRIMARY_COLOR = "#8B0000"
-SECONDARY_COLOR = "#E9A7A7"
-AXIS_BOX_COLOR = "#777777"
-GRID_COLOR = "#E5E5E5"
-RECESSION_SHADE = "#C8C8C8"
+try:
+    from curl_cffi import requests as curl_requests
+    HAVE_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    HAVE_CURL_CFFI = False
+
+# -----------------------------------------------------------------------------
+# FRONTEND CONSTANTS (Streamlit)
+# -----------------------------------------------------------------------------
 
 COUNTRIES = ["United States", "Japan", "Euro Area"]
+
+PRIMARY_COLOR = "#8B0000"      # maroon main line
+SECONDARY_COLOR = "#E9A7A7"    # softer light red/pink
+AXIS_BOX_COLOR = "#777777"     # dark grey frame
+GRID_COLOR = "#E5E5E5"
+RECESSION_SHADE = "#C8C8C8"    # darker grey for recessions
 
 METRIC_LABELS = {
     "cpi": "CPI",
@@ -504,100 +539,19 @@ COUNTRY_COLORS = {
     "Euro Area": SECONDARY_COLOR,
 }
 
+# -----------------------------------------------------------------------------
+# Streamlit page config
+# -----------------------------------------------------------------------------
+
 st.set_page_config(
     page_title="ZY's Alpha Engine",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# -----------------------------------------------------------------------------
-# Streamlit: backend wrappers + global aggregated cache
-# -----------------------------------------------------------------------------
-
-@st.cache_data(ttl=900, show_spinner=True)
-def fetch_constraints_panel(country: str):
-    panel_df = build_country_panel(country)
-    return {
-        "country": country,
-        "panel": panel_df.to_dict(orient="records"),
-        "recessions": RECESSIONS.get(country, []),
-    }
-
-
-@st.cache_data(ttl=900, show_spinner=True)
-def fetch_highfreq(country: str):
-    series_out = build_highfreq_bundle(country)
-    out = {}
-    for name, df in series_out.items():
-        out[name] = df.to_dict(orient="records")
-    return {
-        "country": country,
-        "series": out,
-        "recessions": RECESSIONS.get(country, []),
-    }
-
-
-@st.cache_data(ttl=900, show_spinner=True)
-def fetch_all_calendars():
-    rows = []
-    for c in COUNTRIES:
-        try:
-            js = build_calendar(c)
-            cc = js.get("country", c)
-            for ev in js.get("events", []):
-                rows.append(
-                    {
-                        "date": ev.get("date"),
-                        "event": ev.get("event"),
-                        "importance": ev.get("importance", "").lower(),
-                        "country": cc,
-                    }
-                )
-        except Exception:
-            continue
-
-    if not rows:
-        return pd.DataFrame(columns=["date", "event", "importance", "country", "weekday"])
-
-    df = pd.DataFrame(rows)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"])
-    df["weekday"] = df["date"].dt.strftime("%a")
-    return df.sort_values("date", ascending=False).reset_index(drop=True)
-
-
-@st.cache_data(ttl=0, show_spinner=False)
-def get_recession_ranges_for_country(country: str):
-    recs = RECESSIONS.get(country, [])
-    ranges = []
-    for r in recs:
-        y0 = r.get("start")
-        y1 = r.get("end")
-        if y0 is None or y1 is None:
-            continue
-        try:
-            start = pd.Timestamp(int(y0), 1, 1)
-            end = pd.Timestamp(int(y1) + 1, 1, 1)
-            ranges.append((start, end))
-        except Exception:
-            continue
-    return ranges
-
-
-@st.cache_data(ttl=900, show_spinner=True)
-def load_all_macro_data():
-    constraints = {c: fetch_constraints_panel(c) for c in COUNTRIES}
-    highfreq = {c: fetch_highfreq(c) for c in COUNTRIES}
-    cal_df = fetch_all_calendars()
-    return constraints, highfreq, cal_df
-
-
-ALL_CONSTRAINTS, ALL_HF, CAL_DF = load_all_macro_data()
-
-# -----------------------------------------------------------------------------
-# Streamlit: shared helpers
-# -----------------------------------------------------------------------------
-
+# -------------------------------------------------------------------
+# Global CSS
+# -------------------------------------------------------------------
 st.markdown(
     f"""
     <style>
@@ -653,6 +607,7 @@ st.markdown(
         margin-bottom: 0.6rem;
     }}
 
+    /* Multiselect "pill" tags – economies & metrics (Playground + Strategy) */
     div[data-baseweb="select"] span[data-baseweb="tag"] {{
         background-color: {PRIMARY_COLOR} !important;
         color: #ffffff !important;
@@ -666,12 +621,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# -------------------------------------------------------------------
+# Shared helpers (frontend)
+# -------------------------------------------------------------------
 
 def get_yf_session():
     if HAVE_CURL_CFFI and curl_requests is not None:
         return curl_requests.Session(impersonate="chrome")
     return None
-
 
 def series_to_df(series_json):
     df = pd.DataFrame(series_json)
@@ -681,14 +638,12 @@ def series_to_df(series_json):
     df = df.dropna(subset=["date"])
     return df.sort_values("date").reset_index(drop=True)
 
-
 def compute_yoy(df: pd.DataFrame, col: str = "value", periods: int = 12) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
     df["yoy"] = df[col].pct_change(periods=periods) * 100.0
     return df
-
 
 def style_figure(fig, height=260, legend=False):
     fig.update_layout(
@@ -731,7 +686,6 @@ def style_figure(fig, height=260, legend=False):
         fig.update_layout(showlegend=False)
     return fig
 
-
 def metric_axis_label(metric: str, mode: str) -> str:
     if mode.startswith("YoY"):
         return "YoY % change"
@@ -748,8 +702,10 @@ def metric_axis_label(metric: str, mode: str) -> str:
         return "Level / % of GDP"
     return "Index / level"
 
-
-def z_score(series: pd.Series, dates: pd.Series, mode: str, window_months: int | None) -> pd.Series:
+def z_score(series: pd.Series,
+            dates: pd.Series,
+            mode: str,
+            window_months: int | None) -> pd.Series:
     if series.empty:
         return series
 
@@ -790,8 +746,10 @@ def z_score(series: pd.Series, dates: pd.Series, mode: str, window_months: int |
         return s * 0.0
     return (s - mu) / sigma
 
-
-def align_to_monthly(df_metric: pd.DataFrame, start_date: pd.Timestamp, end_date: pd.Timestamp, max_ffill_months: int = 6) -> pd.DataFrame:
+def align_to_monthly(df_metric: pd.DataFrame,
+                     start_date: pd.Timestamp,
+                     end_date: pd.Timestamp,
+                     max_ffill_months: int = 6) -> pd.DataFrame:
     if df_metric.empty:
         return df_metric
 
@@ -800,11 +758,12 @@ def align_to_monthly(df_metric: pd.DataFrame, start_date: pd.Timestamp, end_date
 
     idx = pd.date_range(start=start_date, end=end_date, freq="MS")
     s = s.reindex(idx)
+
     s["y"] = s["y"].ffill(limit=max_ffill_months)
+
     s = s.dropna(subset=["y"])
     s = s.reset_index().rename(columns={"index": "date"})
     return s
-
 
 def add_recession_bands(fig, rec_ranges, window_start=None, window_end=None):
     if not rec_ranges:
@@ -832,16 +791,78 @@ def add_recession_bands(fig, rec_ranges, window_start=None, window_end=None):
         )
     return fig
 
-
 def choose_recession_country(selected_countries):
     if "United States" in selected_countries:
         return "United States"
     return selected_countries[0]
 
-# -----------------------------------------------------------------------------
-# Sidebar
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# Backend helpers (now local functions, no HTTP)
+# -------------------------------------------------------------------
 
+@st.cache_data(ttl=600, show_spinner=True)
+def fetch_constraints_panel(country: str):
+    return build_constraints_payload(country)
+
+
+@st.cache_data(ttl=600, show_spinner=True)
+def fetch_highfreq(country: str):
+    return build_highfreq_payload(country)
+
+
+@st.cache_data(ttl=600, show_spinner=True)
+def fetch_all_calendars():
+    rows = []
+    for c in COUNTRIES:
+        try:
+            js = build_calendar_payload(c)
+            cc = js.get("country", c)
+            for ev in js.get("events", []):
+                rows.append(
+                    {
+                        "date": ev.get("date"),
+                        "event": ev.get("event"),
+                        "importance": ev.get("importance", "").lower(),
+                        "country": cc,
+                    }
+                )
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame(columns=["date", "event", "importance", "country", "weekday"])
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    df["weekday"] = df["date"].dt.strftime("%a")
+    return df.sort_values("date", ascending=False).reset_index(drop=True)
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_recession_ranges_for_country(country: str):
+    try:
+        constraints = fetch_constraints_panel(country)
+        recs = constraints.get("recessions", [])
+    except Exception:
+        return []
+
+    ranges = []
+    for r in recs:
+        y0 = r.get("start")
+        y1 = r.get("end")
+        if y0 is None or y1 is None:
+            continue
+        try:
+            start = pd.Timestamp(int(y0), 1, 1)
+            end = pd.Timestamp(int(y1) + 1, 1, 1)
+            ranges.append((start, end))
+        except Exception:
+            continue
+    return ranges
+
+# -------------------------------------------------------------------
+# Sidebar
+# -------------------------------------------------------------------
 st.sidebar.title("Macro dashboard")
 country = st.sidebar.selectbox("Focus economy", COUNTRIES, index=0)
 
@@ -855,16 +876,14 @@ Monthly / higher-frequency series for inflation, labour and rates.
 """
 )
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # Tabs
-# -----------------------------------------------------------------------------
-
+# -------------------------------------------------------------------
 tab_dash, tab_play, tab_strategy, tab_data = st.tabs(["Dashboard", "Playground", "Strategy", "Data"])
 
-# -----------------------------------------------------------------------------
+# ===================================================================
 # DASHBOARD
-# -----------------------------------------------------------------------------
-
+# ===================================================================
 with tab_dash:
     st.header("ZYs Alpha Engine")
 
@@ -886,17 +905,26 @@ with tab_dash:
         unsafe_allow_html=True,
     )
 
-    constraints = ALL_CONSTRAINTS.get(country, {"panel": [], "recessions": []})
-    panel = pd.DataFrame(constraints.get("panel", []))
-    recessions = constraints.get("recessions", [])
+    try:
+        constraints = fetch_constraints_panel(country)
+        panel = pd.DataFrame(constraints.get("panel", []))
+        recessions = constraints.get("recessions", [])
+    except Exception as e:
+        st.error(f"Error fetching constraints panel: {e}")
+        st.stop()
 
-    hf_data = ALL_HF.get(country, {"series": {}, "recessions": []})
-    series = hf_data.get("series", {}) or {}
+    try:
+        hf_data = fetch_highfreq(country)
+    except Exception as e:
+        st.error(f"Error fetching high-frequency data: {e}")
+        st.stop()
 
-    cal_df = CAL_DF.copy()
+    cal_df = fetch_all_calendars()
 
+    # A. Policy & growth + economic calendar
     col_cal, gap_col, col_main = st.columns([0.9, 0.1, 3.1])
 
+    # ===== Economic calendar (left) =====
     with col_cal:
         st.markdown('<div class="section-title">Economic calendar</div>', unsafe_allow_html=True)
 
@@ -906,14 +934,14 @@ with tab_dash:
             st.markdown('<div class="chart-heading">Economy</div>', unsafe_allow_html=True)
 
             cal_country = st.selectbox(
-                "Economy",
+                "",
                 ["All"] + COUNTRIES,
                 index=0,
                 key="cal_country",
                 label_visibility="collapsed",
             )
 
-            cal_view = cal_df
+            cal_view = cal_df.copy()
             if cal_country != "All":
                 cal_view = cal_view[cal_view["country"] == cal_country]
 
@@ -1030,6 +1058,7 @@ with tab_dash:
 
                 st_html(calendar_html, height=650, scrolling=False)
 
+    # ===== A. Policy & growth (right) =====
     with col_main:
         st.markdown('<div class="section-title">A. Policy and growth constraints</div>', unsafe_allow_html=True)
 
@@ -1040,15 +1069,15 @@ with tab_dash:
                 if c != "year":
                     panel[c] = pd.to_numeric(panel[c], errors="coerce")
 
-            def add_recessions(fig_obj):
+            def add_recessions(fig):
                 if not recessions:
-                    return fig_obj
+                    return fig
                 for r in recessions:
                     y0 = r.get("start")
                     y1 = r.get("end")
                     if y0 is None or y1 is None:
                         continue
-                    fig_obj.add_vrect(
+                    fig.add_vrect(
                         x0=y0,
                         x1=y1,
                         fillcolor=RECESSION_SHADE,
@@ -1056,143 +1085,117 @@ with tab_dash:
                         line_width=0,
                         layer="below",
                     )
-                return fig_obj
+                return fig
 
+            # Row 1
             r1c1, r1c2, r1c3 = st.columns(3)
 
+            # Inflation vs target
             with r1c1:
                 st.markdown('<div class="chart-heading">Inflation vs target</div>', unsafe_allow_html=True)
                 if "cpi_yoy" in panel.columns:
                     df = panel[["year", "cpi_yoy", "inflation_target"]].dropna(subset=["cpi_yoy"])
-                    if df.empty:
-                        st.markdown(
-                            '<div class="chart-placeholder">Inflation series unavailable.</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        df_long = df.melt(
-                            id_vars="year",
-                            value_vars=["cpi_yoy", "inflation_target"],
-                            var_name="variable",
-                            value_name="value",
-                        )
-                        color_map = {"cpi_yoy": PRIMARY_COLOR, "inflation_target": SECONDARY_COLOR}
-                        fig = px.line(
-                            df_long,
-                            x="year",
-                            y="value",
-                            color="variable",
-                            color_discrete_map=color_map,
-                            labels={"year": "Year", "value": "Percent"},
-                        )
-                        fig = add_recessions(fig)
-                        fig = style_figure(fig, legend=True)
-                        st.plotly_chart(
-                            fig,
-                            width="stretch",
-                            key=f"dash_inflation_vs_target_{country}",
-                        )
-                        st.markdown(
-                            '<div class="chart-comment">'
-                            'Inflation relative to a 2% objective is a clean signal of whether the price regime has been '
-                            'persistently too loose or too tight.'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
+                    df_long = df.melt(
+                        id_vars="year",
+                        value_vars=["cpi_yoy", "inflation_target"],
+                        var_name="variable",
+                        value_name="value",
+                    )
+                    color_map = {"cpi_yoy": PRIMARY_COLOR, "inflation_target": SECONDARY_COLOR}
+                    fig = px.line(
+                        df_long,
+                        x="year",
+                        y="value",
+                        color="variable",
+                        color_discrete_map=color_map,
+                        labels={"year": "Year", "value": "Percent"},
+                    )
+                    fig = add_recessions(fig)
+                    fig = style_figure(fig, legend=True)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.markdown(
+                        '<div class="chart-comment">'
+                        'Inflation relative to a 2% objective is a clean signal of whether the price regime has been '
+                        'persistently too loose or too tight.'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
                     st.markdown(
                         '<div class="chart-placeholder">Inflation series unavailable.</div>',
                         unsafe_allow_html=True,
                     )
 
+            # Public & private leverage
             with r1c2:
                 st.markdown('<div class="chart-heading">Public & private leverage</div>', unsafe_allow_html=True)
                 if "debt_gdp" in panel.columns and "private_credit_gdp" in panel.columns:
                     df = panel[["year", "debt_gdp", "private_credit_gdp"]].dropna(
                         how="all", subset=["debt_gdp", "private_credit_gdp"]
                     )
-                    if df.empty:
-                        st.markdown(
-                            '<div class="chart-placeholder">Debt and credit series unavailable.</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        df_long = df.melt(
-                            id_vars="year",
-                            value_vars=["debt_gdp", "private_credit_gdp"],
-                            var_name="variable",
-                            value_name="value",
-                        )
-                        color_map = {"debt_gdp": PRIMARY_COLOR, "private_credit_gdp": SECONDARY_COLOR}
-                        fig = px.line(
-                            df_long,
-                            x="year",
-                            y="value",
-                            color="variable",
-                            color_discrete_map=color_map,
-                            labels={"year": "Year", "value": "% of GDP"},
-                        )
-                        fig = add_recessions(fig)
-                        fig = style_figure(fig, legend=True)
-                        st.plotly_chart(
-                            fig,
-                            width="stretch",
-                            key=f"dash_leverage_{country}",
-                        )
-                        st.markdown(
-                            '<div class="chart-comment">'
-                            'Government and private-sector debt-to-GDP together are a proxy for how much the growth model '
-                            'leans on balance-sheet expansion rather than productivity.'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
+                    df_long = df.melt(
+                        id_vars="year",
+                        value_vars=["debt_gdp", "private_credit_gdp"],
+                        var_name="variable",
+                        value_name="value",
+                    )
+                    color_map = {"debt_gdp": PRIMARY_COLOR, "private_credit_gdp": SECONDARY_COLOR}
+                    fig = px.line(
+                        df_long,
+                        x="year",
+                        y="value",
+                        color="variable",
+                        color_discrete_map=color_map,
+                        labels={"year": "Year", "value": "% of GDP"},
+                    )
+                    fig = add_recessions(fig)
+                    fig = style_figure(fig, legend=True)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.markdown(
+                        '<div class="chart-comment">'
+                        'Government and private-sector debt-to-GDP together are a proxy for how much the growth model '
+                        'leans on balance-sheet expansion rather than productivity.'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
                     st.markdown(
                         '<div class="chart-placeholder">Debt and credit series unavailable.</div>',
                         unsafe_allow_html=True,
                     )
 
+            # Real policy vs neutral
             with r1c3:
                 st.markdown('<div class="chart-heading">Real policy rate vs neutral</div>', unsafe_allow_html=True)
                 if "real_policy_rate" in panel.columns and "neutral_real_rate" in panel.columns:
                     df = panel[["year", "real_policy_rate", "neutral_real_rate"]].dropna(
                         how="all", subset=["real_policy_rate"]
                     )
-                    if df.empty:
-                        st.markdown(
-                            '<div class="chart-placeholder">Real policy vs neutral series unavailable.</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        df_long = df.melt(
-                            id_vars="year",
-                            value_vars=["real_policy_rate", "neutral_real_rate"],
-                            var_name="variable",
-                            value_name="value",
-                        )
-                        color_map = {"real_policy_rate": PRIMARY_COLOR, "neutral_real_rate": SECONDARY_COLOR}
-                        fig = px.line(
-                            df_long,
-                            x="year",
-                            y="value",
-                            color="variable",
-                            color_discrete_map=color_map,
-                            labels={"year": "Year", "value": "Percent"},
-                        )
-                        fig = add_recessions(fig)
-                        fig = style_figure(fig, legend=True)
-                        st.plotly_chart(
-                            fig,
-                            width="stretch",
-                            key=f"dash_real_policy_vs_neutral_{country}",
-                        )
-                        st.markdown(
-                            '<div class="chart-comment">'
-                            'Real policy relative to neutral is a direct signal of whether financial conditions are '
-                            'systematically tight or loose through the cycle.'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
+                    df_long = df.melt(
+                        id_vars="year",
+                        value_vars=["real_policy_rate", "neutral_real_rate"],
+                        var_name="variable",
+                        value_name="value",
+                    )
+                    color_map = {"real_policy_rate": PRIMARY_COLOR, "neutral_real_rate": SECONDARY_COLOR}
+                    fig = px.line(
+                        df_long,
+                        x="year",
+                        y="value",
+                        color="variable",
+                        color_discrete_map=color_map,
+                        labels={"year": "Year", "value": "Percent"},
+                    )
+                    fig = add_recessions(fig)
+                    fig = style_figure(fig, legend=True)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.markdown(
+                        '<div class="chart-comment">'
+                        'Real policy relative to neutral is a direct signal of whether financial conditions are '
+                        'systematically tight or loose through the cycle.'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
                     st.markdown(
                         '<div class="chart-placeholder">Real policy vs neutral series unavailable.</div>',
@@ -1201,55 +1204,48 @@ with tab_dash:
 
             st.markdown("<div style='height:0.2rem;'></div>", unsafe_allow_html=True)
 
+            # Row 2
             r2c1, r2c2, r2c3 = st.columns(3)
 
+            # Growth vs real rate
             with r2c1:
                 st.markdown('<div class="chart-heading">Growth vs real policy rate</div>', unsafe_allow_html=True)
                 if "real_gdp_growth" in panel.columns and "real_policy_rate" in panel.columns:
                     df = panel[["year", "real_gdp_growth", "real_policy_rate"]].dropna(
                         how="all", subset=["real_gdp_growth"]
                     )
-                    if df.empty:
-                        st.markdown(
-                            '<div class="chart-placeholder">Growth and real-rate series unavailable.</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        df_long = df.melt(
-                            id_vars="year",
-                            value_vars=["real_gdp_growth", "real_policy_rate"],
-                            var_name="variable",
-                            value_name="value",
-                        )
-                        color_map = {"real_gdp_growth": PRIMARY_COLOR, "real_policy_rate": SECONDARY_COLOR}
-                        fig = px.line(
-                            df_long,
-                            x="year",
-                            y="value",
-                            color="variable",
-                            color_discrete_map=color_map,
-                            labels={"year": "Year", "value": "Percent"},
-                        )
-                        fig = add_recessions(fig)
-                        fig = style_figure(fig, legend=True)
-                        st.plotly_chart(
-                            fig,
-                            width="stretch",
-                            key=f"dash_growth_vs_real_policy_{country}",
-                        )
-                        st.markdown(
-                            '<div class="chart-comment">'
-                            'Real growth relative to the real policy rate is a proxy for whether activity is being '
-                            'constrained by policy or by deeper structural forces.'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
+                    df_long = df.melt(
+                        id_vars="year",
+                        value_vars=["real_gdp_growth", "real_policy_rate"],
+                        var_name="variable",
+                        value_name="value",
+                    )
+                    color_map = {"real_gdp_growth": PRIMARY_COLOR, "real_policy_rate": SECONDARY_COLOR}
+                    fig = px.line(
+                        df_long,
+                        x="year",
+                        y="value",
+                        color="variable",
+                        color_discrete_map=color_map,
+                        labels={"year": "Year", "value": "Percent"},
+                    )
+                    fig = add_recessions(fig)
+                    fig = style_figure(fig, legend=True)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.markdown(
+                        '<div class="chart-comment">'
+                        'Real growth relative to the real policy rate is a proxy for whether activity is being '
+                        'constrained by policy or by deeper structural forces.'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
                     st.markdown(
                         '<div class="chart-placeholder">Growth and real-rate series unavailable.</div>',
                         unsafe_allow_html=True,
                     )
 
+            # Fiscal balance
             with r2c2:
                 st.markdown('<div class="chart-heading">Fiscal balance / GDP</div>', unsafe_allow_html=True)
                 if "fiscal_balance" in panel.columns:
@@ -1269,11 +1265,7 @@ with tab_dash:
                         )
                         fig = add_recessions(fig)
                         fig = style_figure(fig, legend=False)
-                        st.plotly_chart(
-                            fig,
-                            width="stretch",
-                            key=f"dash_fiscal_balance_{country}",
-                        )
+                        st.plotly_chart(fig, use_container_width=True)
                         st.markdown(
                             '<div class="chart-comment">'
                             'The fiscal balance as a share of GDP is a signal of how far aggregate demand is being '
@@ -1287,44 +1279,40 @@ with tab_dash:
                         unsafe_allow_html=True,
                     )
 
+            # Total borrowing
             with r2c3:
                 st.markdown('<div class="chart-heading">Total borrowing / GDP</div>', unsafe_allow_html=True)
                 if "total_borrowing_gdp" in panel.columns:
                     df = panel[["year", "total_borrowing_gdp"]].dropna(subset=["total_borrowing_gdp"])
-                    if df.empty:
-                        st.markdown(
-                            '<div class="chart-placeholder">Total borrowing series unavailable.</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        fig = px.line(
-                            df,
-                            x="year",
-                            y="total_borrowing_gdp",
-                            labels={"year": "Year", "total_borrowing_gdp": "% of GDP"},
-                            color_discrete_sequence=[PRIMARY_COLOR],
-                        )
-                        fig = add_recessions(fig)
-                        fig = style_figure(fig, legend=False)
-                        st.plotly_chart(
-                            fig,
-                            width="stretch",
-                            key=f"dash_total_borrowing_{country}",
-                        )
-                        st.markdown(
-                            '<div class="chart-comment">'
-                            'Total public-plus-private debt-to-GDP is a proxy for the system’s sensitivity to shifts in '
-                            'funding costs, credit availability, and risk premia.'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
+                    fig = px.line(
+                        df,
+                        x="year",
+                        y="total_borrowing_gdp",
+                        labels={"year": "Year", "total_borrowing_gdp": "% of GDP"},
+                        color_discrete_sequence=[PRIMARY_COLOR],
+                    )
+                    fig = add_recessions(fig)
+                    fig = style_figure(fig, legend=False)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.markdown(
+                        '<div class="chart-comment">'
+                        'Total public-plus-private debt-to-GDP is a proxy for the system’s sensitivity to shifts in '
+                        'funding costs, credit availability, and risk premia.'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
                 else:
                     st.markdown(
                         '<div class="chart-placeholder">Total borrowing series unavailable.</div>',
                         unsafe_allow_html=True,
                     )
 
+    # ----------------------------------------------------------------
+    # B. High-frequency macro – full width
+    # ----------------------------------------------------------------
     st.markdown('<div class="section-title">B. High-frequency macro (FRED)</div>', unsafe_allow_html=True)
+
+    series = hf_data.get("series", {})
 
     def get_metric_df(name: str):
         s = series.get(name)
@@ -1341,6 +1329,7 @@ with tab_dash:
     df_y10 = get_metric_df("yield_10y")
     df_y10_real = get_metric_df("real_yield_10y")
 
+    # CPI + policy
     b1c1, b1c2 = st.columns(2)
     with b1c1:
         st.markdown('<div class="chart-heading">CPI YoY</div>', unsafe_allow_html=True)
@@ -1354,11 +1343,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                width="stretch",
-                key=f"dash_cpi_yoy_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'High-frequency CPI YoY is an early signal of the direction and momentum of underlying inflation '
@@ -1383,11 +1368,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                width="stretch",
-                key=f"dash_policy_rate_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'The policy-rate path is a real-time signal of how aggressively the central bank has tightened or '
@@ -1401,6 +1382,7 @@ with tab_dash:
                 unsafe_allow_html=True,
             )
 
+    # Labour
     b2c1, b2c2 = st.columns(2)
     with b2c1:
         st.markdown('<div class="chart-heading">Unemployment rate</div>', unsafe_allow_html=True)
@@ -1413,11 +1395,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                width="stretch",
-                key=f"dash_unemployment_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'The unemployment rate is a summary signal of labour-market slack and the risk of wage and inflation '
@@ -1443,11 +1421,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                width="stretch",
-                key=f"dash_wages_yoy_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'Wage growth YoY is a proxy for the strength of income gains feeding into demand and medium-term '
@@ -1461,6 +1435,7 @@ with tab_dash:
                 unsafe_allow_html=True,
             )
 
+    # External position
     b3c1, b3c2 = st.columns(2)
     with b3c1:
         st.markdown('<div class="chart-heading">REER proxy (YoY)</div>', unsafe_allow_html=True)
@@ -1474,11 +1449,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                width="stretch",
-                key=f"dash_reer_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'Real effective exchange-rate changes are a proxy for shifts in external competitiveness and the '
@@ -1503,11 +1474,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                width="stretch",
-                key=f"dash_current_account_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'The current-account balance is a signal of whether the economy is exporting or importing net savings, '
@@ -1521,6 +1488,7 @@ with tab_dash:
                 unsafe_allow_html=True,
             )
 
+    # Ten-year yields
     st.markdown('<div class="chart-heading" style="margin-top:0.8rem;">10-year nominal vs real yield</div>', unsafe_allow_html=True)
     if not df_y10.empty or not df_y10_real.empty:
         fig_y = None
@@ -1555,11 +1523,7 @@ with tab_dash:
                 )
 
         fig_y = style_figure(fig_y, height=280, legend=True)
-        st.plotly_chart(
-            fig_y,
-            width="stretch",
-            key=f"dash_10y_yields_{country}",
-        )
+        st.plotly_chart(fig_y, use_container_width=True)
         st.markdown(
             '<div class="chart-comment">'
             'The level of nominal and real 10-year yields is a proxy for the stance of long-horizon financial '
@@ -1573,10 +1537,9 @@ with tab_dash:
             unsafe_allow_html=True,
         )
 
-# -----------------------------------------------------------------------------
-# PLAYGROUND
-# -----------------------------------------------------------------------------
-
+# ===================================================================
+# PLAYGROUND TAB
+# ===================================================================
 with tab_play:
     st.header("Macro Playground")
 
@@ -1601,10 +1564,13 @@ with tab_play:
         if not selected_metrics:
             st.info("Select at least one metric to plot.")
         else:
-            hf_by_country = {
-                c: ALL_HF.get(c, {"series": {}}).get("series", {}) or {}
-                for c in selected_countries
-            }
+            hf_by_country = {}
+            for c in selected_countries:
+                try:
+                    js = fetch_highfreq(c)
+                    hf_by_country[c] = js.get("series", {}) or {}
+                except Exception:
+                    hf_by_country[c] = {}
 
             all_dates = []
             for c in selected_countries:
@@ -1624,15 +1590,14 @@ with tab_play:
             if not all_dates:
                 st.info("No overlapping high-frequency data for the current selection.")
             else:
-                min_date_raw = min(all_dates)
-                max_date_raw = max(all_dates)
-                default_min = max(min_date_raw, max_date_raw - pd.DateOffset(years=15))
+                min_date = min(all_dates).date()
+                max_date = max(all_dates).date()
 
                 start_date, end_date = st.slider(
                     "Sample window",
-                    min_value=min_date_raw.date(),
-                    max_value=max_date_raw.date(),
-                    value=(default_min.date(), max_date_raw.date()),
+                    min_value=min_date,
+                    max_value=max_date,
+                    value=(min_date, max_date),
                     help="Apply the same date window to all charts below.",
                 )
 
@@ -1918,11 +1883,7 @@ with tab_play:
                             else "Z-score (within series)",
                         )
                         fig = style_figure(fig, height=320, legend=True)
-                        st.plotly_chart(
-                            fig,
-                            width="stretch",
-                            key=f"playground_{metric}",
-                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
                     st.markdown(
                         '<div class="chart-comment">'
@@ -1934,11 +1895,10 @@ with tab_play:
                         unsafe_allow_html=True,
                     )
 
-# -----------------------------------------------------------------------------
-# Helper: Yahoo history
-# -----------------------------------------------------------------------------
-
-@st.cache_data(ttl=900, show_spinner=False)
+# -------------------------------------------------------------------
+# Helper: fetch Yahoo price history using shared session
+# -------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
 def fetch_ticker_history(symbol: str, start_date, end_date, interval: str):
     symbol = symbol.upper().strip()
     if not symbol:
@@ -1946,18 +1906,23 @@ def fetch_ticker_history(symbol: str, start_date, end_date, interval: str):
 
     session = get_yf_session()
     if session is not None:
-        return yf.Ticker(symbol, session=session).history(
-            start=start_date, end=end_date, interval=interval
-        ).reset_index()
+        ticker_obj = yf.Ticker(symbol, session=session)
     else:
-        return yf.Ticker(symbol).history(
-            start=start_date, end=end_date, interval=interval
-        ).reset_index()
+        ticker_obj = yf.Ticker(symbol)
 
-# -----------------------------------------------------------------------------
-# STRATEGY
-# -----------------------------------------------------------------------------
+    hist = ticker_obj.history(start=start_date, end=end_date, interval=interval)
+    if hist.empty:
+        return pd.DataFrame(columns=["date", "ticker", "Close"])
 
+    hist = hist.reset_index()
+    date_col = "Date" if "Date" in hist.columns else hist.columns[0]
+    out = hist[[date_col, "Close"]].rename(columns={date_col: "date"})
+    out["ticker"] = symbol
+    return out
+
+# ===================================================================
+# STRATEGY SANDBOX TAB
+# ===================================================================
 with tab_strategy:
     st.header("Strategy sandbox")
 
@@ -1994,10 +1959,13 @@ with tab_strategy:
                 format_func=lambda k: METRIC_LABELS.get(k, k),
             )
 
-        hf_by_country = {
-            c: ALL_HF.get(c, {"series": {}}).get("series", {}) or {}
-            for c in selected_countries
-        }
+        hf_by_country = {}
+        for c in selected_countries:
+            try:
+                js = fetch_highfreq(c)
+                hf_by_country[c] = js.get("series", {}) or {}
+            except Exception:
+                hf_by_country[c] = {}
 
         all_dates = []
         for c in selected_countries:
@@ -2016,15 +1984,14 @@ with tab_strategy:
         if not all_dates:
             st.info("No overlapping data for this metric across selected economies.")
         else:
-            min_date_raw = min(all_dates)
-            max_date_raw = max(all_dates)
-            default_min = max(min_date_raw, max_date_raw - pd.DateOffset(years=15))
+            min_date = min(all_dates).date()
+            max_date = max(all_dates).date()
 
             start_date, end_date = st.slider(
                 "Sample / backtest window",
-                min_value=min_date_raw.date(),
-                max_value=max_date_raw.date(),
-                value=(default_min.date(), max_date_raw.date()),
+                min_value=min_date,
+                max_value=max_date,
+                value=(min_date, max_date),
                 help="Signal is built over this window; ticker backtest will use the same dates.",
             )
 
@@ -2340,7 +2307,7 @@ with tab_strategy:
                 fig = style_figure(fig, height=320, legend=True)
                 st.plotly_chart(
                     fig,
-                    width="stretch",
+                    use_container_width=True,
                     key=f"strategy_macro_{metric}",
                 )
 
@@ -2447,28 +2414,20 @@ with tab_strategy:
                             try:
                                 session = get_yf_session()
                                 if session is not None:
-                                    tk_hist = yf.Ticker(
-                                        ticker_bt.strip(), session=session
-                                    ).history(
-                                        start=start_date,
-                                        end=end_date,
-                                        interval="1d",
-                                    )
+                                    tk = yf.Ticker(ticker_bt.strip(), session=session)
                                 else:
-                                    tk_hist = yf.Ticker(
-                                        ticker_bt.strip()
-                                    ).history(
-                                        start=start_date,
-                                        end=end_date,
-                                        interval="1d",
-                                    )
+                                    tk = yf.Ticker(ticker_bt.strip())
 
-                                if tk_hist.empty:
+                                px_df = tk.history(
+                                    start=start_date, end=end_date, interval="1d"
+                                )
+
+                                if px_df.empty:
                                     st.error(
                                         "No price data returned for this ticker and window."
                                     )
                                 else:
-                                    px_df = tk_hist.reset_index()
+                                    px_df = px_df.reset_index()
                                     date_col = (
                                         "Date"
                                         if "Date" in px_df.columns
@@ -2548,6 +2507,8 @@ with tab_strategy:
                                                 (merged["position_lag"] < 0)
                                                 & (merged["pos_prev"] >= 0)
                                             ].copy()
+
+                                        import math
 
                                         n_days = len(merged)
                                         if n_days <= 1:
@@ -2666,11 +2627,13 @@ with tab_strategy:
                                                     ),
                                                 )
 
-                                            rec_ranges_bt = rec_ranges
-                                            if rec_ranges_bt:
+                                            rec_ranges = get_recession_ranges_for_country(
+                                                choose_recession_country(selected_countries)
+                                            )
+                                            if rec_ranges:
                                                 fig_sig_bt = add_recession_bands(
                                                     fig_sig_bt,
-                                                    rec_ranges_bt,
+                                                    rec_ranges,
                                                     window_start=merged["date"].min(),
                                                     window_end=merged["date"].max(),
                                                 )
@@ -2685,7 +2648,7 @@ with tab_strategy:
                                             )
                                             st.plotly_chart(
                                                 fig_sig_bt,
-                                                width="stretch",
+                                                use_container_width=True,
                                                 key=f"strategy_signal_bt_{ticker_bt}_{signal_choice}",
                                             )
 
@@ -2734,10 +2697,10 @@ with tab_strategy:
                                                     ),
                                                 )
 
-                                            if rec_ranges_bt:
+                                            if rec_ranges:
                                                 fig_bt = add_recession_bands(
                                                     fig_bt,
-                                                    rec_ranges_bt,
+                                                    rec_ranges,
                                                     window_start=merged["date"].min(),
                                                     window_end=merged["date"].max(),
                                                 )
@@ -2751,7 +2714,7 @@ with tab_strategy:
                                             )
                                             st.plotly_chart(
                                                 fig_bt,
-                                                width="stretch",
+                                                use_container_width=True,
                                                 key=f"strategy_pnl_{ticker_bt}_{signal_choice}",
                                             )
 
@@ -2777,33 +2740,25 @@ with tab_strategy:
                                             )
                                             st.dataframe(
                                                 stats_df,
-                                                width="stretch",
+                                                use_container_width=True,
                                                 hide_index=True,
                                             )
                             except Exception as e:
                                 st.error(f"Error during backtest: {e}")
 
-# -----------------------------------------------------------------------------
+# ===================================================================
 # DATA TAB
-# -----------------------------------------------------------------------------
-
+# ===================================================================
 with tab_data:
     st.header("Inspect Data")
     st.write("**Panel data (A. Policy & growth constraints)**")
-
-    constraints = ALL_CONSTRAINTS.get(country, {"panel": []})
-    panel = pd.DataFrame(constraints.get("panel", []))
-
-    if not panel.empty:
-        st.dataframe(panel, width="stretch")
+    if 'panel' in globals() and not panel.empty:
+        st.dataframe(panel, use_container_width=True)
     else:
         st.info("No panel data available.")
 
-    st.write("**High-frequency series available (B. FRED)**")
-
-    hf_data = ALL_HF.get(country, {"series": {}})
-    series_meta = list(hf_data.get("series", {}).keys())
-    if series_meta:
-        st.write(series_meta)
+    st.write("**High-frequency series metadata (B. FRED)**")
+    if 'hf_data' in globals():
+        st.json(hf_data.get("series", {}))
     else:
-        st.info("No high-frequency metadata available.")
+        st.info("No high-frequency data available.")
