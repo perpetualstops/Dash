@@ -1,6 +1,6 @@
 import math
 from functools import lru_cache
-from typing import Dict, Any
+from typing import Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
 
@@ -8,15 +8,21 @@ import requests
 import pandas as pd
 import numpy as np
 
-import numpy as np
 import yfinance as yf
 import datetime as dt
 import plotly.express as px
 import streamlit as st
 from streamlit.components.v1 import html as st_html
 
+try:
+    from curl_cffi import requests as curl_requests
+    HAVE_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    HAVE_CURL_CFFI = False
+
 # -----------------------------------------------------------------------------
-# Global HTTP session (connection reuse)
+# Backend: config
 # -----------------------------------------------------------------------------
 
 SESSION = requests.Session()
@@ -27,36 +33,28 @@ SESSION.headers.update(
     }
 )
 
-# -----------------------------------------------------------------------------
-# Config: countries & series
-# -----------------------------------------------------------------------------
-
 FRED_API_KEY = "7a1c5818d73952bce4995758997574ce"
 
-# World Bank indicators (annual)
 WB_INDICATORS: Dict[str, str] = {
-    "cpi_yoy": "FP.CPI.TOTL.ZG",               # Inflation, consumer prices (annual %)
-    "debt_gdp": "GC.DOD.TOTL.GD.ZS",           # Central govt debt (% of GDP)
-    "fiscal_balance": "GC.BAL.CASH.GD.ZS",     # Cash surplus/deficit (% of GDP)
-    "real_gdp_growth": "NY.GDP.MKTP.KD.ZG",    # Real GDP growth (annual %)
-    "private_credit_gdp": "FS.AST.PRVT.GD.ZS", # Domestic credit to private sector (% of GDP)
+    "cpi_yoy": "FP.CPI.TOTL.ZG",
+    "debt_gdp": "GC.DOD.TOTL.GD.ZS",
+    "fiscal_balance": "GC.BAL.CASH.GD.ZS",
+    "real_gdp_growth": "NY.GDP.MKTP.KD.ZG",
+    "private_credit_gdp": "FS.AST.PRVT.GD.ZS",
 }
 
-# FRED series IDs for ANNUAL policy rate aggregation
 FRED_SERIES_POLICY: Dict[str, str] = {
     "United States": "FEDFUNDS",
     "Japan": "IRSTCB01JPM156N",
     "Euro Area": "ECBMRRFR",
 }
 
-# World Bank country codes
 WB_COUNTRY: Dict[str, str] = {
     "United States": "USA",
     "Japan": "JPN",
     "Euro Area": "EMU",
 }
 
-# Approximate recession bands for shading (year ranges)
 RECESSIONS: Dict[str, list] = {
     "United States": [
         {"start": 1990, "end": 1991},
@@ -77,14 +75,12 @@ RECESSIONS: Dict[str, list] = {
     ],
 }
 
-# Simple “neutral” real rate to compute gaps
 NEUTRAL_REAL_RATE: Dict[str, float] = {
     "United States": 1.0,
     "Japan": 0.0,
     "Euro Area": 0.5,
 }
 
-# High-frequency FRED series for each country
 FRED_HF_SERIES: Dict[str, Dict[str, str]] = {
     "United States": {
         "cpi": "CPIAUCSL",
@@ -109,7 +105,7 @@ FRED_HF_SERIES: Dict[str, Dict[str, str]] = {
     "Euro Area": {
         "cpi": "CP0000EZ19M086NEST",
         "policy_rate": "ECBMRRFR",
-        "unemployment": "UNRATE",   # fallback
+        "unemployment": "UNRATE",
         "wages": "",
         "reer": "",
         "current_account": "",
@@ -118,71 +114,11 @@ FRED_HF_SERIES: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Concurrency knobs
-MAX_WB_WORKERS: int = 5
-MAX_FRED_HF_WORKERS: int = 8
+MAX_WB_WORKERS: int = 3
+MAX_FRED_HF_WORKERS: int = 4
 
 # -----------------------------------------------------------------------------
-# JSON sanitiser – kill NaN / inf everywhere
-# -----------------------------------------------------------------------------
-
-def _sanitize_for_json(obj: Any) -> Any:
-    if isinstance(obj, pd.DataFrame):
-        obj = obj.replace([np.inf, -np.inf], np.nan)
-        records = obj.to_dict(orient="records")
-        return [_sanitize_for_json(r) for r in records]
-
-    if isinstance(obj, pd.Series):
-        return _sanitize_for_json(obj.to_dict())
-
-    if isinstance(obj, dict):
-        return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
-
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json(v) for v in obj]
-
-    try:
-        if obj is pd.NA:
-            return None
-    except Exception:
-        pass
-
-    try:
-        if isinstance(obj, float) and math.isnan(obj):
-            return None
-    except Exception:
-        pass
-
-    if isinstance(obj, (np.floating, np.float32, np.float64)):
-        v = float(obj)
-        if math.isfinite(v):
-            return v
-        return None
-
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-
-    if isinstance(obj, float):
-        if math.isfinite(obj):
-            return obj
-        return None
-
-    if isinstance(obj, int):
-        return obj
-
-    if isinstance(obj, (bool, np.bool_)):
-        return bool(obj)
-
-    if isinstance(obj, (datetime, date, pd.Timestamp)):
-        return obj.isoformat()
-
-    if obj is None:
-        return None
-
-    return obj
-
-# -----------------------------------------------------------------------------
-# World Bank + FRED fetchers (with caching + parallelism)
+# Backend: core fetchers
 # -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
@@ -285,9 +221,6 @@ def to_annual(df: pd.DataFrame, method: str = "mean") -> pd.DataFrame:
         ann = df.groupby("year", as_index=False)["value"].mean()
     return ann.sort_values("year")
 
-# -----------------------------------------------------------------------------
-# Parallel bulk fetch helpers
-# -----------------------------------------------------------------------------
 
 def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
     def worker(name: str, ind: str) -> tuple[str, pd.DataFrame]:
@@ -303,10 +236,7 @@ def _fetch_worldbank_bulk(wb_code: str) -> Dict[str, pd.DataFrame]:
 
     max_workers = min(len(items), MAX_WB_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(worker, name, ind): name
-            for name, ind in items
-        }
+        future_map = {executor.submit(worker, name, ind): name for name, ind in items}
         for fut in as_completed(future_map):
             name = future_map[fut]
             try:
@@ -338,10 +268,7 @@ def _fetch_highfreq_bulk(mapping: Dict[str, str]) -> Dict[str, pd.DataFrame]:
 
     max_workers = min(len(items), MAX_FRED_HF_WORKERS)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(worker, name, sid): name
-            for name, sid in items
-        }
+        future_map = {executor.submit(worker, name, sid): name for name, sid in items}
         for fut in as_completed(future_map):
             name = future_map[fut]
             try:
@@ -356,7 +283,7 @@ def _fetch_highfreq_bulk(mapping: Dict[str, str]) -> Dict[str, pd.DataFrame]:
     return results
 
 # -----------------------------------------------------------------------------
-# Panel construction (annual macro constraints)
+# Backend: panel + high-frequency bundle + calendar
 # -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
@@ -365,7 +292,6 @@ def build_country_panel(country: str) -> pd.DataFrame:
         raise ValueError(f"Unsupported country: {country}")
 
     wb_code = WB_COUNTRY[country]
-
     series_dfs: Dict[str, pd.DataFrame] = _fetch_worldbank_bulk(wb_code)
 
     policy_id = FRED_SERIES_POLICY.get(country, "")
@@ -397,7 +323,6 @@ def build_country_panel(country: str) -> pd.DataFrame:
     panel = panel.merge(pol_ann, on="year", how="left")
 
     infl_col = "cpi_yoy"
-
     if infl_col in panel.columns:
         panel["real_policy_rate"] = panel["policy_rate"] - panel[infl_col]
     else:
@@ -405,7 +330,6 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     neutral = NEUTRAL_REAL_RATE.get(country, 0.0)
     panel["neutral_real_rate"] = neutral
-
     panel["real_rate_minus_neutral"] = panel["real_policy_rate"] - panel["neutral_real_rate"]
 
     if "real_gdp_growth" in panel.columns:
@@ -431,43 +355,16 @@ def build_country_panel(country: str) -> pd.DataFrame:
 
     return panel.sort_values("year").reset_index(drop=True)
 
-# -----------------------------------------------------------------------------
-# High-frequency bundle (macro block B)
-# -----------------------------------------------------------------------------
 
 @lru_cache(maxsize=None)
 def build_highfreq_bundle(country: str) -> Dict[str, pd.DataFrame]:
     if country not in FRED_HF_SERIES:
         raise ValueError(f"Unsupported country: {country}")
-
     mapping = FRED_HF_SERIES[country]
     return _fetch_highfreq_bulk(mapping)
 
-# -----------------------------------------------------------------------------
-# Backend-style payload builders (no FastAPI, used directly by Streamlit)
-# -----------------------------------------------------------------------------
 
-def build_constraints_payload(country: str) -> Dict[str, Any]:
-    panel_df = build_country_panel(country)
-    resp = {
-        "country": country,
-        "panel": panel_df,
-        "recessions": RECESSIONS.get(country, []),
-    }
-    return _sanitize_for_json(resp)
-
-
-def build_highfreq_payload(country: str) -> Dict[str, Any]:
-    series_out = build_highfreq_bundle(country)
-    resp = {
-        "country": country,
-        "series": series_out,
-        "recessions": RECESSIONS.get(country, []),
-    }
-    return _sanitize_for_json(resp)
-
-
-def build_calendar_payload(country: str) -> Dict[str, Any]:
+def build_calendar(country: str) -> Dict:
     if country not in WB_COUNTRY:
         raise ValueError(f"Unsupported country: {country}")
 
@@ -488,7 +385,7 @@ def build_calendar_payload(country: str) -> Dict[str, Any]:
             {"date": f"{year}-09-18", "event": "FOMC Meeting", "importance": "high"},
             {"date": f"{year}-12-18", "event": "FOMC Meeting", "importance": "high"},
         ]
-    else:  # Euro Area
+    else:
         events = [
             {"date": f"{year}-03-15", "event": "ECB Governing Council", "importance": "high"},
             {"date": f"{year}-06-14", "event": "ECB Governing Council", "importance": "high"},
@@ -496,31 +393,19 @@ def build_calendar_payload(country: str) -> Dict[str, Any]:
             {"date": f"{year}-12-13", "event": "ECB Governing Council", "importance": "high"},
         ]
 
-    return _sanitize_for_json({"country": country, "events": events})
-
-
-# -----------------------------------------------------------------------------
-# OPTIONAL: curl_cffi session for yfinance (frontend)
-# -----------------------------------------------------------------------------
-
-try:
-    from curl_cffi import requests as curl_requests
-    HAVE_CURL_CFFI = True
-except ImportError:
-    curl_requests = None
-    HAVE_CURL_CFFI = False
+    return {"country": country, "events": events}
 
 # -----------------------------------------------------------------------------
-# FRONTEND CONSTANTS (Streamlit)
+# Streamlit: global config
 # -----------------------------------------------------------------------------
+
+PRIMARY_COLOR = "#8B0000"
+SECONDARY_COLOR = "#E9A7A7"
+AXIS_BOX_COLOR = "#777777"
+GRID_COLOR = "#E5E5E5"
+RECESSION_SHADE = "#C8C8C8"
 
 COUNTRIES = ["United States", "Japan", "Euro Area"]
-
-PRIMARY_COLOR = "#8B0000"      # maroon main line
-SECONDARY_COLOR = "#E9A7A7"    # softer light red/pink
-AXIS_BOX_COLOR = "#777777"     # dark grey frame
-GRID_COLOR = "#E5E5E5"
-RECESSION_SHADE = "#C8C8C8"    # darker grey for recessions
 
 METRIC_LABELS = {
     "cpi": "CPI",
@@ -539,19 +424,12 @@ COUNTRY_COLORS = {
     "Euro Area": SECONDARY_COLOR,
 }
 
-# -----------------------------------------------------------------------------
-# Streamlit page config
-# -----------------------------------------------------------------------------
-
 st.set_page_config(
     page_title="ZY's Alpha Engine",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# -------------------------------------------------------------------
-# Global CSS
-# -------------------------------------------------------------------
 st.markdown(
     f"""
     <style>
@@ -607,7 +485,6 @@ st.markdown(
         margin-bottom: 0.6rem;
     }}
 
-    /* Multiselect "pill" tags – economies & metrics (Playground + Strategy) */
     div[data-baseweb="select"] span[data-baseweb="tag"] {{
         background-color: {PRIMARY_COLOR} !important;
         color: #ffffff !important;
@@ -621,14 +498,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# -------------------------------------------------------------------
-# Shared helpers (frontend)
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Streamlit: shared helpers
+# -----------------------------------------------------------------------------
 
 def get_yf_session():
     if HAVE_CURL_CFFI and curl_requests is not None:
         return curl_requests.Session(impersonate="chrome")
     return None
+
 
 def series_to_df(series_json):
     df = pd.DataFrame(series_json)
@@ -638,12 +516,14 @@ def series_to_df(series_json):
     df = df.dropna(subset=["date"])
     return df.sort_values("date").reset_index(drop=True)
 
+
 def compute_yoy(df: pd.DataFrame, col: str = "value", periods: int = 12) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
     df["yoy"] = df[col].pct_change(periods=periods) * 100.0
     return df
+
 
 def style_figure(fig, height=260, legend=False):
     fig.update_layout(
@@ -686,6 +566,7 @@ def style_figure(fig, height=260, legend=False):
         fig.update_layout(showlegend=False)
     return fig
 
+
 def metric_axis_label(metric: str, mode: str) -> str:
     if mode.startswith("YoY"):
         return "YoY % change"
@@ -702,10 +583,8 @@ def metric_axis_label(metric: str, mode: str) -> str:
         return "Level / % of GDP"
     return "Index / level"
 
-def z_score(series: pd.Series,
-            dates: pd.Series,
-            mode: str,
-            window_months: int | None) -> pd.Series:
+
+def z_score(series: pd.Series, dates: pd.Series, mode: str, window_months: int | None) -> pd.Series:
     if series.empty:
         return series
 
@@ -746,10 +625,8 @@ def z_score(series: pd.Series,
         return s * 0.0
     return (s - mu) / sigma
 
-def align_to_monthly(df_metric: pd.DataFrame,
-                     start_date: pd.Timestamp,
-                     end_date: pd.Timestamp,
-                     max_ffill_months: int = 6) -> pd.DataFrame:
+
+def align_to_monthly(df_metric: pd.DataFrame, start_date: pd.Timestamp, end_date: pd.Timestamp, max_ffill_months: int = 6) -> pd.DataFrame:
     if df_metric.empty:
         return df_metric
 
@@ -758,12 +635,11 @@ def align_to_monthly(df_metric: pd.DataFrame,
 
     idx = pd.date_range(start=start_date, end=end_date, freq="MS")
     s = s.reindex(idx)
-
     s["y"] = s["y"].ffill(limit=max_ffill_months)
-
     s = s.dropna(subset=["y"])
     s = s.reset_index().rename(columns={"index": "date"})
     return s
+
 
 def add_recession_bands(fig, rec_ranges, window_start=None, window_end=None):
     if not rec_ranges:
@@ -791,23 +667,37 @@ def add_recession_bands(fig, rec_ranges, window_start=None, window_end=None):
         )
     return fig
 
+
 def choose_recession_country(selected_countries):
     if "United States" in selected_countries:
         return "United States"
     return selected_countries[0]
 
-# -------------------------------------------------------------------
-# Backend helpers (now local functions, no HTTP)
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Streamlit: backend wrappers (no HTTP)
+# -----------------------------------------------------------------------------
 
 @st.cache_data(ttl=600, show_spinner=True)
 def fetch_constraints_panel(country: str):
-    return build_constraints_payload(country)
+    panel_df = build_country_panel(country)
+    return {
+        "country": country,
+        "panel": panel_df.to_dict(orient="records"),
+        "recessions": RECESSIONS.get(country, []),
+    }
 
 
 @st.cache_data(ttl=600, show_spinner=True)
 def fetch_highfreq(country: str):
-    return build_highfreq_payload(country)
+    series_out = build_highfreq_bundle(country)
+    out = {}
+    for name, df in series_out.items():
+        out[name] = df.to_dict(orient="records")
+    return {
+        "country": country,
+        "series": out,
+        "recessions": RECESSIONS.get(country, []),
+    }
 
 
 @st.cache_data(ttl=600, show_spinner=True)
@@ -815,7 +705,7 @@ def fetch_all_calendars():
     rows = []
     for c in COUNTRIES:
         try:
-            js = build_calendar_payload(c)
+            js = build_calendar(c)
             cc = js.get("country", c)
             for ev in js.get("events", []):
                 rows.append(
@@ -838,14 +728,10 @@ def fetch_all_calendars():
     df["weekday"] = df["date"].dt.strftime("%a")
     return df.sort_values("date", ascending=False).reset_index(drop=True)
 
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_recession_ranges_for_country(country: str):
-    try:
-        constraints = fetch_constraints_panel(country)
-        recs = constraints.get("recessions", [])
-    except Exception:
-        return []
-
+    recs = RECESSIONS.get(country, [])
     ranges = []
     for r in recs:
         y0 = r.get("start")
@@ -860,9 +746,10 @@ def get_recession_ranges_for_country(country: str):
             continue
     return ranges
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Sidebar
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
 st.sidebar.title("Macro dashboard")
 country = st.sidebar.selectbox("Focus economy", COUNTRIES, index=0)
 
@@ -876,14 +763,16 @@ Monthly / higher-frequency series for inflation, labour and rates.
 """
 )
 
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Tabs
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
 tab_dash, tab_play, tab_strategy, tab_data = st.tabs(["Dashboard", "Playground", "Strategy", "Data"])
 
-# ===================================================================
+# -----------------------------------------------------------------------------
 # DASHBOARD
-# ===================================================================
+# -----------------------------------------------------------------------------
+
 with tab_dash:
     st.header("ZYs Alpha Engine")
 
@@ -921,10 +810,8 @@ with tab_dash:
 
     cal_df = fetch_all_calendars()
 
-    # A. Policy & growth + economic calendar
     col_cal, gap_col, col_main = st.columns([0.9, 0.1, 3.1])
 
-    # ===== Economic calendar (left) =====
     with col_cal:
         st.markdown('<div class="section-title">Economic calendar</div>', unsafe_allow_html=True)
 
@@ -1058,7 +945,6 @@ with tab_dash:
 
                 st_html(calendar_html, height=650, scrolling=False)
 
-    # ===== A. Policy & growth (right) =====
     with col_main:
         st.markdown('<div class="section-title">A. Policy and growth constraints</div>', unsafe_allow_html=True)
 
@@ -1087,10 +973,8 @@ with tab_dash:
                     )
                 return fig
 
-            # Row 1
             r1c1, r1c2, r1c3 = st.columns(3)
 
-            # Inflation vs target
             with r1c1:
                 st.markdown('<div class="chart-heading">Inflation vs target</div>', unsafe_allow_html=True)
                 if "cpi_yoy" in panel.columns:
@@ -1126,7 +1010,6 @@ with tab_dash:
                         unsafe_allow_html=True,
                     )
 
-            # Public & private leverage
             with r1c2:
                 st.markdown('<div class="chart-heading">Public & private leverage</div>', unsafe_allow_html=True)
                 if "debt_gdp" in panel.columns and "private_credit_gdp" in panel.columns:
@@ -1164,7 +1047,6 @@ with tab_dash:
                         unsafe_allow_html=True,
                     )
 
-            # Real policy vs neutral
             with r1c3:
                 st.markdown('<div class="chart-heading">Real policy rate vs neutral</div>', unsafe_allow_html=True)
                 if "real_policy_rate" in panel.columns and "neutral_real_rate" in panel.columns:
@@ -1204,10 +1086,8 @@ with tab_dash:
 
             st.markdown("<div style='height:0.2rem;'></div>", unsafe_allow_html=True)
 
-            # Row 2
             r2c1, r2c2, r2c3 = st.columns(3)
 
-            # Growth vs real rate
             with r2c1:
                 st.markdown('<div class="chart-heading">Growth vs real policy rate</div>', unsafe_allow_html=True)
                 if "real_gdp_growth" in panel.columns and "real_policy_rate" in panel.columns:
@@ -1245,7 +1125,6 @@ with tab_dash:
                         unsafe_allow_html=True,
                     )
 
-            # Fiscal balance
             with r2c2:
                 st.markdown('<div class="chart-heading">Fiscal balance / GDP</div>', unsafe_allow_html=True)
                 if "fiscal_balance" in panel.columns:
@@ -1279,7 +1158,6 @@ with tab_dash:
                         unsafe_allow_html=True,
                     )
 
-            # Total borrowing
             with r2c3:
                 st.markdown('<div class="chart-heading">Total borrowing / GDP</div>', unsafe_allow_html=True)
                 if "total_borrowing_gdp" in panel.columns:
@@ -1307,9 +1185,6 @@ with tab_dash:
                         unsafe_allow_html=True,
                     )
 
-    # ----------------------------------------------------------------
-    # B. High-frequency macro – full width
-    # ----------------------------------------------------------------
     st.markdown('<div class="section-title">B. High-frequency macro (FRED)</div>', unsafe_allow_html=True)
 
     series = hf_data.get("series", {})
@@ -1329,7 +1204,6 @@ with tab_dash:
     df_y10 = get_metric_df("yield_10y")
     df_y10_real = get_metric_df("real_yield_10y")
 
-    # CPI + policy
     b1c1, b1c2 = st.columns(2)
     with b1c1:
         st.markdown('<div class="chart-heading">CPI YoY</div>', unsafe_allow_html=True)
@@ -1382,7 +1256,6 @@ with tab_dash:
                 unsafe_allow_html=True,
             )
 
-    # Labour
     b2c1, b2c2 = st.columns(2)
     with b2c1:
         st.markdown('<div class="chart-heading">Unemployment rate</div>', unsafe_allow_html=True)
@@ -1435,7 +1308,6 @@ with tab_dash:
                 unsafe_allow_html=True,
             )
 
-    # External position
     b3c1, b3c2 = st.columns(2)
     with b3c1:
         st.markdown('<div class="chart-heading">REER proxy (YoY)</div>', unsafe_allow_html=True)
@@ -1488,7 +1360,6 @@ with tab_dash:
                 unsafe_allow_html=True,
             )
 
-    # Ten-year yields
     st.markdown('<div class="chart-heading" style="margin-top:0.8rem;">10-year nominal vs real yield</div>', unsafe_allow_html=True)
     if not df_y10.empty or not df_y10_real.empty:
         fig_y = None
@@ -1537,9 +1408,10 @@ with tab_dash:
             unsafe_allow_html=True,
         )
 
-# ===================================================================
-# PLAYGROUND TAB
-# ===================================================================
+# -----------------------------------------------------------------------------
+# PLAYGROUND
+# -----------------------------------------------------------------------------
+
 with tab_play:
     st.header("Macro Playground")
 
@@ -1590,14 +1462,15 @@ with tab_play:
             if not all_dates:
                 st.info("No overlapping high-frequency data for the current selection.")
             else:
-                min_date = min(all_dates).date()
-                max_date = max(all_dates).date()
+                min_date_raw = min(all_dates)
+                max_date_raw = max(all_dates)
+                default_min = max(min_date_raw, max_date_raw - pd.DateOffset(years=15))
 
                 start_date, end_date = st.slider(
                     "Sample window",
-                    min_value=min_date,
-                    max_value=max_date,
-                    value=(min_date, max_date),
+                    min_value=min_date_raw.date(),
+                    max_value=max_date_raw.date(),
+                    value=(default_min.date(), max_date_raw.date()),
                     help="Apply the same date window to all charts below.",
                 )
 
@@ -1895,9 +1768,10 @@ with tab_play:
                         unsafe_allow_html=True,
                     )
 
-# -------------------------------------------------------------------
-# Helper: fetch Yahoo price history using shared session
-# -------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Helper: Yahoo history
+# -----------------------------------------------------------------------------
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_ticker_history(symbol: str, start_date, end_date, interval: str):
     symbol = symbol.upper().strip()
@@ -1920,9 +1794,10 @@ def fetch_ticker_history(symbol: str, start_date, end_date, interval: str):
     out["ticker"] = symbol
     return out
 
-# ===================================================================
-# STRATEGY SANDBOX TAB
-# ===================================================================
+# -----------------------------------------------------------------------------
+# STRATEGY
+# -----------------------------------------------------------------------------
+
 with tab_strategy:
     st.header("Strategy sandbox")
 
@@ -1984,14 +1859,15 @@ with tab_strategy:
         if not all_dates:
             st.info("No overlapping data for this metric across selected economies.")
         else:
-            min_date = min(all_dates).date()
-            max_date = max(all_dates).date()
+            min_date_raw = min(all_dates)
+            max_date_raw = max(all_dates)
+            default_min = max(min_date_raw, max_date_raw - pd.DateOffset(years=15))
 
             start_date, end_date = st.slider(
                 "Sample / backtest window",
-                min_value=min_date,
-                max_value=max_date,
-                value=(min_date, max_date),
+                min_value=min_date_raw.date(),
+                max_value=max_date_raw.date(),
+                value=(default_min.date(), max_date_raw.date()),
                 help="Signal is built over this window; ticker backtest will use the same dates.",
             )
 
@@ -2627,9 +2503,6 @@ with tab_strategy:
                                                     ),
                                                 )
 
-                                            rec_ranges = get_recession_ranges_for_country(
-                                                choose_recession_country(selected_countries)
-                                            )
                                             if rec_ranges:
                                                 fig_sig_bt = add_recession_bands(
                                                     fig_sig_bt,
@@ -2746,19 +2619,27 @@ with tab_strategy:
                             except Exception as e:
                                 st.error(f"Error during backtest: {e}")
 
-# ===================================================================
+# -----------------------------------------------------------------------------
 # DATA TAB
-# ===================================================================
+# -----------------------------------------------------------------------------
+
 with tab_data:
     st.header("Inspect Data")
     st.write("**Panel data (A. Policy & growth constraints)**")
-    if 'panel' in globals() and not panel.empty:
+    try:
+        constraints = fetch_constraints_panel(country)
+        panel = pd.DataFrame(constraints.get("panel", []))
+    except Exception:
+        panel = pd.DataFrame()
+    if not panel.empty:
         st.dataframe(panel, use_container_width=True)
     else:
         st.info("No panel data available.")
 
-    st.write("**High-frequency series metadata (B. FRED)**")
-    if 'hf_data' in globals():
-        st.json(hf_data.get("series", {}))
-    else:
-        st.info("No high-frequency data available.")
+    st.write("**High-frequency series available (B. FRED)**")
+    try:
+        hf_data = fetch_highfreq(country)
+        series_meta = list(hf_data.get("series", {}).keys())
+        st.write(series_meta)
+    except Exception:
+        st.info("No high-frequency metadata available.")
