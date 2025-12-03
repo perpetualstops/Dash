@@ -3,8 +3,6 @@ from functools import lru_cache
 from typing import Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date
-import calendar
-from typing import Any
 
 import requests
 import pandas as pd
@@ -998,11 +996,7 @@ with tab_dash:
                     )
                     fig = add_recessions(fig)
                     fig = style_figure(fig, legend=True)
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True,
-                        key=f"dash_inflation_vs_target_{country}",
-                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     st.markdown(
                         '<div class="chart-comment">'
                         'Inflation relative to a 2% objective is a clean signal of whether the price regime has been '
@@ -1039,11 +1033,7 @@ with tab_dash:
                     )
                     fig = add_recessions(fig)
                     fig = style_figure(fig, legend=True)
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True,
-                        key=f"dash_leverage_{country}",
-                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     st.markdown(
                         '<div class="chart-comment">'
                         'Government and private-sector debt-to-GDP together are a proxy for how much the growth model '
@@ -1080,11 +1070,7 @@ with tab_dash:
                     )
                     fig = add_recessions(fig)
                     fig = style_figure(fig, legend=True)
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True,
-                        key=f"dash_real_policy_vs_neutral_{country}",
-                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     st.markdown(
                         '<div class="chart-comment">'
                         'Real policy relative to neutral is a direct signal of whether financial conditions are '
@@ -1125,11 +1111,7 @@ with tab_dash:
                     )
                     fig = add_recessions(fig)
                     fig = style_figure(fig, legend=True)
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True,
-                        key=f"dash_growth_vs_real_policy_{country}",
-                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     st.markdown(
                         '<div class="chart-comment">'
                         'Real growth relative to the real policy rate is a proxy for whether activity is being '
@@ -1162,11 +1144,7 @@ with tab_dash:
                         )
                         fig = add_recessions(fig)
                         fig = style_figure(fig, legend=False)
-                        st.plotly_chart(
-                            fig,
-                            use_container_width=True,
-                            key=f"dash_fiscal_balance_{country}",
-                        )
+                        st.plotly_chart(fig, use_container_width=True)
                         st.markdown(
                             '<div class="chart-comment">'
                             'The fiscal balance as a share of GDP is a signal of how far aggregate demand is being '
@@ -1193,11 +1171,7 @@ with tab_dash:
                     )
                     fig = add_recessions(fig)
                     fig = style_figure(fig, legend=False)
-                    st.plotly_chart(
-                        fig,
-                        use_container_width=True,
-                        key=f"dash_total_borrowing_{country}",
-                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     st.markdown(
                         '<div class="chart-comment">'
                         'Total public-plus-private debt-to-GDP is a proxy for the system’s sensitivity to shifts in '
@@ -1243,11 +1217,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key=f"dash_cpi_yoy_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'High-frequency CPI YoY is an early signal of the direction and momentum of underlying inflation '
@@ -1272,11 +1242,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key=f"dash_policy_rate_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'The policy-rate path is a real-time signal of how aggressively the central bank has tightened or '
@@ -1302,11 +1268,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key=f"dash_unemployment_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'The unemployment rate is a summary signal of labour-market slack and the risk of wage and inflation '
@@ -1332,11 +1294,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key=f"dash_wages_yoy_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'Wage growth YoY is a proxy for the strength of income gains feeding into demand and medium-term '
@@ -1363,11 +1321,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key=f"dash_reer_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'Real effective exchange-rate changes are a proxy for shifts in external competitiveness and the '
@@ -1392,11 +1346,7 @@ with tab_dash:
                 color_discrete_sequence=[PRIMARY_COLOR],
             )
             fig = style_figure(fig, height=260, legend=False)
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-                key=f"dash_current_account_{country}",
-            )
+            st.plotly_chart(fig, use_container_width=True)
             st.markdown(
                 '<div class="chart-comment">'
                 'The current-account balance is a signal of whether the economy is exporting or importing net savings, '
@@ -1444,11 +1394,7 @@ with tab_dash:
                 )
 
         fig_y = style_figure(fig_y, height=280, legend=True)
-        st.plotly_chart(
-            fig_y,
-            use_container_width=True,
-            key=f"dash_10y_yields_{country}",
-        )
+        st.plotly_chart(fig_y, use_container_width=True)
         st.markdown(
             '<div class="chart-comment">'
             'The level of nominal and real 10-year yields is a proxy for the stance of long-horizon financial '
@@ -1810,11 +1756,7 @@ with tab_play:
                             else "Z-score (within series)",
                         )
                         fig = style_figure(fig, height=320, legend=True)
-                        st.plotly_chart(
-                            fig,
-                            use_container_width=True,
-                            key=f"playground_{metric}",
-                        )
+                        st.plotly_chart(fig, use_container_width=True)
 
                     st.markdown(
                         '<div class="chart-comment">'
