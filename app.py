@@ -1419,21 +1419,95 @@ with tab_analytics:
         """
         <p style="font-size:13px; color:#555555; margin-top:0rem; margin-bottom:0.5rem;">
         Rolling, out-of-sample signals on a small set of core indicators. One look should tell you:
-        (i) how hot/cold the economy is, and (ii) which block is most concerning.
+        (i) how hot/cold the economy is, and (ii) which block is most concerning, and (iii) where prints are most
+        likely to deliver upside/downside surprises.
         </p>
         """,
         unsafe_allow_html=True,
     )
 
-    # pull high-frequency series for focus country
+    # pull high-frequency series for current focus country
     try:
-        hf_data_ana = fetch_highfreq(country)
-        series_ana = hf_data_ana.get("series", {}) or {}
+        hf_data = fetch_highfreq(country)
+        series = hf_data.get("series", {}) or {}
     except Exception as e:
         st.error(f"Error fetching high-frequency data: {e}")
         st.stop()
 
-    # core indicators on the 1-pager
+    if not series:
+        st.info("No high-frequency data available for analytics.")
+        st.stop()
+
+    ctrl1, ctrl2, ctrl3 = st.columns(3)
+    with ctrl1:
+        norm_method = st.selectbox(
+            "Normalisation",
+            ["Mean / std", "Median / MAD"],
+            index=0,
+            help="How to standardise each series in the rolling window.",
+        )
+    with ctrl2:
+        window_months = st.slider(
+            "Rolling window (months)",
+            min_value=36,
+            max_value=240,
+            value=120,
+            step=12,
+            help="History length used for out-of-sample z-scores.",
+        )
+    with ctrl3:
+        this_year = date.today().year
+        regime_start_year = st.slider(
+            "Regime start year",
+            min_value=1990,
+            max_value=this_year - 3,
+            value=min(2010, this_year - 5),
+            step=1,
+            help="Ignore data before this year when constructing analytics.",
+        )
+
+    # local rolling z to keep everything out-of-sample in time
+    def rolling_z(series: pd.Series,
+                  dates: pd.Series,
+                  window_months: int,
+                  method: str) -> pd.Series:
+        s = series.astype("float64")
+        dts = pd.to_datetime(dates)
+        out = pd.Series(index=s.index, dtype="float64")
+
+        for i in range(len(s)):
+            v = s.iloc[i]
+            d = dts.iloc[i]
+            if pd.isna(v) or pd.isna(d):
+                out.iloc[i] = pd.NA
+                continue
+
+            start = d - pd.DateOffset(months=window_months)
+            mask = (dts >= start) & (dts <= d) & (~s.isna())
+            window_vals = s[mask]
+            if window_vals.empty:
+                out.iloc[i] = pd.NA
+                continue
+
+            if method == "Median / MAD":
+                med = window_vals.median()
+                mad = (window_vals - med).abs().median()
+                if mad is None or mad == 0:
+                    out.iloc[i] = 0.0
+                else:
+                    out.iloc[i] = (v - med) / (1.4826 * mad)
+            else:
+                mu = window_vals.mean()
+                sigma = window_vals.std()
+                if sigma is None or sigma == 0:
+                    out.iloc[i] = 0.0
+                else:
+                    out.iloc[i] = (v - mu) / sigma
+
+        return out
+
+    # core indicators for the 1-pager
+    # good_when_high is the direction of "health"
     key_metrics = {
         "cpi": {
             "label": "CPI (YoY)",
@@ -1468,11 +1542,9 @@ with tab_analytics:
     }
 
     rows = []
-    window_months = 120  # 10y rolling z => each point only sees history up to t
-    fwd_horizon = 12     # months ahead for simple "hit-rate" test
 
     for m_key, cfg in key_metrics.items():
-        raw = series_ana.get(m_key)
+        raw = series.get(m_key)
         if not raw:
             continue
 
@@ -1480,10 +1552,13 @@ with tab_analytics:
         if df.empty:
             continue
 
-        df = df[df["date"] <= pd.Timestamp.today()].copy()
-        df = df.sort_values("date")
+        # keep only regime period (plus a year back for YoY calculations)
+        df = df[df["date"] >= pd.Timestamp(regime_start_year - 1, 1, 1)].copy()
+        if df.empty:
+            continue
 
-        # base transform for z-score
+        df = df[df["date"] <= pd.Timestamp.today()].sort_values("date")
+
         if cfg["transform"] == "yoy":
             df = compute_yoy(df, "value", periods=12)
             col = "yoy"
@@ -1494,18 +1569,17 @@ with tab_analytics:
         if df.empty:
             continue
 
-        # rolling z-score (out-of-sample in time)
-        df["z_roll"] = z_score(
-            df[col],
-            df["date"],
-            mode="Rolling",
-            window_months=window_months,
-        )
+        df["z"] = rolling_z(df[col], df["date"], window_months, norm_method)
 
-        latest = df.dropna(subset=["z_roll"]).iloc[-1]
-        val = float(latest[col])
-        z = float(latest["z_roll"])
+        df_valid = df.dropna(subset=[col, "z"])
+        if df_valid.empty:
+            continue
 
+        latest = df_valid.iloc[-1]
+        val = latest[col]
+        z = latest["z"]
+
+        # direction-adjusted score: positive = "healthy" given cfg["good_when_high"]
         direction_sign = 1.0 if cfg["good_when_high"] else -1.0
         strength_score = direction_sign * z
 
@@ -1516,61 +1590,38 @@ with tab_analytics:
         else:
             status = "Near normal"
 
-        # seasonal bias: only where YoY makes sense
-        seasonal_z = None
-        if cfg["transform"] == "yoy":
-            df_seas = df.dropna(subset=["yoy"]).copy()
-            if len(df_seas) >= 5:
-                df_seas["month"] = df_seas["date"].dt.month
-                df_seas["year"] = df_seas["date"].dt.year
-                last_row = df_seas.iloc[-1]
-                m = int(last_row["month"])
-                y = int(last_row["year"])
-                v_yoy = float(last_row["yoy"])
-                hist = df_seas[
-                    (df_seas["month"] == m) & (df_seas["year"] < y)
-                ]["yoy"].dropna()
-                if len(hist) >= 5:
-                    mu = float(hist.mean())
-                    sigma = float(hist.std(ddof=0))
-                    if sigma == 0:
-                        seasonal_z = 0.0
-                    else:
-                        seasonal_z = (v_yoy - mu) / sigma
+        # crude surprise bias: stretched series tend to mean-revert
+        if z >= 1.5:
+            surprise_bias = "Upside surprise bias"
+        elif z <= -1.5:
+            surprise_bias = "Downside surprise bias"
+        else:
+            surprise_bias = "Neutral"
 
-        # hit-rate: does sign(z_roll) get the direction of YoY move right?
-        hit_rate_last = None
-        if cfg["transform"] == "yoy":
-            df_hit = df[["date", "yoy", "z_roll"]].dropna().copy()
-            if len(df_hit) > fwd_horizon + 24:
-                df_hit["yoy_fwd"] = df_hit["yoy"].shift(-fwd_horizon)
-                df_hit["delta"] = df_hit["yoy_fwd"] - df_hit["yoy"]
-                df_hit = df_hit.dropna(subset=["delta", "z_roll"])
-                if not df_hit.empty:
-                    df_hit["signal_sign"] = np.sign(df_hit["z_roll"])
-                    df_hit["target_sign"] = np.sign(df_hit["delta"])
-                    df_hit["correct"] = (
-                        (df_hit["signal_sign"] != 0)
-                        & (df_hit["signal_sign"] == df_hit["target_sign"])
-                    )
-                    df_hit["hit_rate"] = (
-                        df_hit["correct"]
-                        .rolling(window=window_months, min_periods=24)
-                        .mean()
-                    )
-                    hit_rate_last = float(df_hit["hit_rate"].dropna().iloc[-1]) \
-                        if df_hit["hit_rate"].notna().any() else None
+        # data quality: coverage + missingness in regime window
+        span_years = (df_valid["date"].max() - df_valid["date"].min()).days / 365.25
+        month_idx = pd.date_range(
+            df_valid["date"].min(), df_valid["date"].max(), freq="MS"
+        )
+        miss_ratio = 1.0 - len(df_valid) / max(len(month_idx), 1)
+
+        if span_years < 5 or miss_ratio > 0.25:
+            data_quality = "Poor"
+        elif span_years < 8 or miss_ratio > 0.15:
+            data_quality = "OK"
+        else:
+            data_quality = "Good"
 
         rows.append(
             {
                 "Metric": cfg["label"],
-                "Latest": val,
-                "Rolling_z": z,
-                "Seasonal_z": seasonal_z,
+                "Latest": f"{val:.2f}",
+                "z-score": z,
                 "Direction": "High is good" if cfg["good_when_high"] else "High is bad",
-                "Macro_read": status,
+                "Macro read": status,
                 "Strength_score": strength_score,
-                "Hit_rate": hit_rate_last,
+                "Beat/miss bias": surprise_bias,
+                "Data quality": data_quality,
                 "Raw_metric_key": m_key,
                 "Transform": cfg["transform"],
             }
@@ -1582,18 +1633,43 @@ with tab_analytics:
 
     snap_df = pd.DataFrame(rows)
 
-    # rank by Strength_score
+    # block-level scores
+    block_defs = {
+        "Growth": ["wages", "unemployment"],
+        "Inflation": ["cpi"],
+        "Policy stance": ["policy_rate", "yield_10y", "real_yield_10y"],
+    }
+
+    st.markdown("### Macro blocks")
+
+    bcols = st.columns(len(block_defs))
+    for (idx, (block_name, keys)) in enumerate(block_defs.items()):
+        blk = snap_df[snap_df["Raw_metric_key"].isin(keys)]
+        if blk.empty:
+            score = np.nan
+            label = "No data"
+        else:
+            score = blk["Strength_score"].mean()
+            if score > 1.0:
+                label = "Hot / tight"
+            elif score < -1.0:
+                label = "Weak / loose"
+            else:
+                label = "Neutral"
+
+        with bcols[idx]:
+            if np.isnan(score):
+                st.metric(label=block_name, value="–", delta=label)
+            else:
+                st.metric(
+                    label=block_name,
+                    value=f"{score:.2f}",
+                    delta=label,
+                )
+
+    # rank by Strength_score – higher means "healthier" given the direction
     snap_df_display = snap_df.sort_values("Strength_score", ascending=False).copy()
-    snap_df_display["Rolling_z"] = snap_df_display["Rolling_z"].map(
-        lambda x: f"{x:.2f}"
-    )
-    snap_df_display["Seasonal_z"] = snap_df_display["Seasonal_z"].map(
-        lambda x: "n/a" if pd.isna(x) else f"{x:.2f}"
-    )
-    snap_df_display["Hit_rate_10y"] = snap_df_display["Hit_rate"].map(
-        lambda x: "n/a" if x is None or pd.isna(x) else f"{x*100:.1f}%"
-    )
-    snap_df_display["Latest"] = snap_df_display["Latest"].map(
+    snap_df_display["z-score"] = snap_df_display["z-score"].map(
         lambda x: f"{x:.2f}"
     )
 
@@ -1604,11 +1680,11 @@ with tab_analytics:
             [
                 "Metric",
                 "Latest",
-                "Rolling_z",
-                "Seasonal_z",
+                "z-score",
                 "Direction",
-                "Macro_read",
-                "Hit_rate_10y",
+                "Macro read",
+                "Beat/miss bias",
+                "Data quality",
             ]
         ],
         use_container_width=True,
@@ -1622,11 +1698,12 @@ with tab_analytics:
         f"""
         **Read-through**
 
-        - Strongest block: **{strongest['Metric']}** – {strongest['Macro_read'].lower()}  
-        - Most concerning: **{weakest['Metric']}** – {weakest['Macro_read'].lower()}
+        - Strongest block metric: **{strongest['Metric']}** – {strongest['Macro read'].lower()}  
+        - Most concerning metric: **{weakest['Metric']}** – {weakest['Macro read'].lower()}  
+        - Beat/miss bias: weakest metric currently shows **{weakest['Beat/miss bias']}**.
 
-        Rolling z-scores are built on a 10-year window. Where seasonal z is large in absolute value,
-        the next print is more likely to mean-revert than extend the move.
+        Treat the weakest block and its key metric as the place where upcoming prints are most likely to
+        generate narrative and policy risk.
         """.strip()
     )
 
@@ -1645,9 +1722,16 @@ with tab_analytics:
     m_key = meta["Raw_metric_key"]
     transform = meta["Transform"]
 
-    df_full = series_to_df(series_ana.get(m_key, []))
+    df_full = series_to_df(series.get(m_key, []))
     if df_full.empty:
         st.info("No data for this indicator.")
+        st.stop()
+
+    df_full = df_full[
+        df_full["date"] >= pd.Timestamp(regime_start_year - 1, 1, 1)
+    ].copy()
+    if df_full.empty:
+        st.info("No data in selected regime window for this indicator.")
         st.stop()
 
     df_full = df_full.sort_values("date")
@@ -1689,13 +1773,12 @@ with tab_analytics:
 
     st.markdown(
         '<div class="chart-comment">'
-        'Snapshot table uses rolling z-scores and seasonal patterns; this line chart exposes the raw series '
-        'so you can sanity-check the regime call and see the run-up into the latest print.'
+        'Line chart on the chosen basis (level / YoY / MoM) over the current regime window.'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    # bar chart over last N years
+    # bar chart on last N years (MoM/YoY/Level)
     bar_years = st.slider(
         "Bar window (years)",
         min_value=3,
@@ -1721,8 +1804,8 @@ with tab_analytics:
 
     st.markdown(
         '<div class="chart-comment">'
-        'Bars over the last few years highlight whether the indicator is accelerating or decelerating into the '
-        'most recent prints.'
+        'Bars over the last few years show how the indicator is running into the latest prints – '
+        'accelerating, stabilising or rolling over.'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -1734,12 +1817,15 @@ with tab_analytics:
     if df_season.empty:
         st.info("Not enough YoY history to compute seasonality.")
     else:
+        import calendar
+
         df_season["year"] = df_season["date"].dt.year
         df_season["month"] = df_season["date"].dt.month
 
         pivot = df_season.pivot_table(
             index="year", columns="month", values="yoy", aggfunc="mean"
-        ).sort_index(ascending=False)
+        )
+        pivot = pivot.sort_index(ascending=False)
 
         month_labels = [calendar.month_abbr[m] for m in pivot.columns]
 
@@ -1758,8 +1844,8 @@ with tab_analytics:
 
         st.markdown(
             '<div class="chart-comment">'
-            'Heatmap shows whether this indicator has stable seasonal patterns and how unusual the latest year is '
-            'relative to history. Strong red/blue in the most recent row = regime shift vs typical seasonality.'
+            'Heatmap shows seasonal patterns and how unusual the latest year is relative to history. '
+            'Strong red/blue in the last row flags a regime shift vs typical seasonality.'
             '</div>',
             unsafe_allow_html=True,
         )
