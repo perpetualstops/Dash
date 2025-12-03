@@ -1427,7 +1427,6 @@ with tab_analytics:
         unsafe_allow_html=True,
     )
 
-    # pull cached high-frequency data for current focus country
     try:
         hf_data = fetch_highfreq(country)
         series = hf_data.get("series", {}) or {}
@@ -1435,7 +1434,6 @@ with tab_analytics:
         st.error(f"Error fetching high-frequency data: {e}")
         st.stop()
 
-    # core metrics, direction and block mapping
     key_metrics = {
         "cpi": {
             "label": "CPI (YoY)",
@@ -1475,7 +1473,6 @@ with tab_analytics:
         },
     }
 
-    # history window
     hist_years = st.slider(
         "History window (years)",
         min_value=5,
@@ -1486,7 +1483,6 @@ with tab_analytics:
         key="analytics_hist_years",
     )
 
-    # small helpers
     def prep_metric_df(raw_json):
         df = series_to_df(raw_json)
         if df.empty:
@@ -1550,7 +1546,7 @@ with tab_analytics:
             if np.isnan(p):
                 return np.nan
             x = 2.0 * (p / 100.0 - 0.5)
-            return direction_sign * x  # [-2, 2] approx
+            return direction_sign * x
 
         level_score = pct_to_score(level_pct)
         mom_score = pct_to_score(mom_pct)
@@ -1563,17 +1559,11 @@ with tab_analytics:
             macro_read = "Near neutral"
 
         if abs(level_score) > 1.2:
-            if level_score > 0:
-                bias = "Mean-reversion risk ↓"
-            else:
-                bias = "Mean-reversion risk ↑"
+            bias = "Mean-reversion risk ↓" if level_score > 0 else "Mean-reversion risk ↑"
         else:
             bias = "Balanced"
 
-        if np.isnan(latest_mom):
-            mom_str = "n/a"
-        else:
-            mom_str = f"{latest_mom:+.2f}"
+        mom_str = "n/a" if np.isnan(latest_mom) else f"{latest_mom:+.2f}"
 
         rows.append(
             {
@@ -1596,46 +1586,50 @@ with tab_analytics:
 
     snap_df = pd.DataFrame(rows)
 
-    # snapshot table styled like a macro grid
-    snap_df_display = snap_df.copy()
-    snap_df_display["Level pct"] = snap_df_display["Level pct"].map(
-        lambda x: f"{x:.0f}%" if not np.isnan(x) else "n/a"
-    )
-    snap_df_display["3M mom pct"] = snap_df_display["3M mom pct"].map(
-        lambda x: f"{x:.0f}%" if not np.isnan(x) else "n/a"
-    )
-
     st.markdown("### Indicator grid")
 
     def strength_color(val):
-        if np.isnan(val):
+        try:
+            v = float(val)
+        except (TypeError, ValueError):
             return "background-color:#f5f5f5;color:#000000"
-        if val >= 1.2:
+        if np.isnan(v):
+            return "background-color:#f5f5f5;color:#000000"
+        if v >= 1.2:
             col = "#1a9850"
-        elif val >= 0.4:
+        elif v >= 0.4:
             col = "#a6d96a"
-        elif val <= -1.2:
+        elif v <= -1.2:
             col = "#d73027"
-        elif val <= -0.4:
+        elif v <= -0.4:
             col = "#fdae61"
         else:
             col = "#ffffbf"
         return f"background-color:{col};color:#000000"
 
+    display_cols = [
+        "Metric",
+        "Block",
+        "Latest",
+        "Level pct",
+        "3M mom pct",
+        "Macro read",
+        "Bias",
+    ]
+    snap_df_display = snap_df[display_cols].copy()
+
+    def fmt_pct(x):
+        return "n/a" if np.isnan(x) else f"{x:.0f}%"
+
     styled = (
-        snap_df_display[
-            [
-                "Metric",
-                "Block",
-                "Latest",
-                "Level pct",
-                "3M mom pct",
-                "Macro read",
-                "Bias",
-            ]
-        ]
-        .style.applymap(
-            strength_color, subset=pd.IndexSlice[:, ["Level pct", "3M mom pct"]]
+        snap_df_display.style.format(
+            {
+                "Level pct": fmt_pct,
+                "3M mom pct": fmt_pct,
+            }
+        ).applymap(
+            strength_color,
+            subset=pd.IndexSlice[:, ["Level pct", "3M mom pct"]],
         )
     )
 
@@ -1651,7 +1645,6 @@ with tab_analytics:
         unsafe_allow_html=True,
     )
 
-    # block-level summary heatmap
     st.markdown("### Block snapshot – level vs momentum")
 
     blocks_order = ["Growth", "Inflation", "Policy", "Labour", "Financial"]
@@ -1678,7 +1671,6 @@ with tab_analytics:
         if max_abs == 0:
             max_abs = 1.0
         heat_fig.update_coloraxes(cmin=-max_abs, cmax=max_abs)
-
         heat_fig.update_layout(
             height=220,
             margin=dict(l=0, r=30, t=30, b=5),
